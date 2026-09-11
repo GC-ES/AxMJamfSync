@@ -172,17 +172,32 @@ enum DiagnosticsExporter {
     // the documented sandbox-safe way to get a zip of a folder's contents
     // without shelling out to /usr/bin/zip (not guaranteed reachable/
     // entitled from inside the App Sandbox) or a third-party archiving library.
+    //
+    // Fix: the coordinator's zip lives at a temporary location whose lifetime
+    // is tied to the coordinated read — it is only guaranteed to exist while
+    // still inside this closure. The previous code captured the URL and moved
+    // it AFTER `coordinate(...)` had already returned, which could race with
+    // the temp file being cleaned up ("X couldn't be moved to Y because
+    // either the former doesn't exist..."). Copy to `destination` from inside
+    // the closure instead — copyItem is also the safer choice than moveItem
+    // here regardless, since the source is coordinator-owned temp storage and
+    // the destination is a user-granted sandbox extension (Desktop, etc.),
+    // not a plain rename target.
     var coordError: NSError?
-    var zippedURL: URL?
+    var copyError: Error?
     NSFileCoordinator().coordinate(readingItemAt: stagingDir, options: .forUploading, error: &coordError) { zipURL in
-      zippedURL = zipURL
+      do {
+        if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+        try fm.copyItem(at: zipURL, to: destination)
+      } catch {
+        copyError = error
+      }
     }
     if let coordError { throw coordError }
-    guard let zippedURL else {
+    if let copyError { throw copyError }
+    guard fm.fileExists(atPath: destination.path) else {
       throw NSError(domain: "AxMJamfSync.Diagnostics", code: 1,
                      userInfo: [NSLocalizedDescriptionKey: "Could not create the diagnostics archive."])
     }
-    if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
-    try fm.moveItem(at: zippedURL, to: destination)
   }
 }

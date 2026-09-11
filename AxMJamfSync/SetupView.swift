@@ -353,17 +353,37 @@ struct JamfCredentialsPanel: View {
     @State private var isSavedToKeychain = false
     @State private var verifiedAt: Date? = nil
     @State private var autoSaveTask: Task<Void, Never>? = nil
+    @State private var revalidationTask: Task<Void, Never>? = nil
     @State private var pageSize: Int = 1000       // local mirror of store.jamfCredentials.pageSize
 
     /// 3.1: debounced auto-save — see AxMCredentialsPanel.scheduleAutoSave.
+    ///
+    /// 4.hotfix3: this used to call the full store.saveJamfCredentials() on every
+    /// 600ms pause, including mid-edit partial values (canonicalOrigin has no
+    /// notion of "complete" — every keystroke changes it). Since saveJamfCredentials
+    /// also stamps jamfValidatedOrigin to whatever it just saw, each subsequent
+    /// still-partial value again looked "changed" against that new baseline,
+    /// re-triggering a full mapping-revalidation-pending sweep + forced Jamf
+    /// re-fetch on nearly every pause while someone was simply fixing a typo.
+    /// Split in two: the fast 600ms path only persists to Keychain (cheap, safe
+    /// to run constantly so nothing typed is ever lost); the origin-comparison
+    /// and revalidation trigger only run after a longer real settle period.
     private func scheduleAutoSave() {
         autoSaveTask?.cancel()
         autoSaveTask = Task {
             try? await Task.sleep(nanoseconds: 600_000_000)
             guard !Task.isCancelled else { return }
             guard !store.jamfCredentials.url.isEmpty || !store.jamfCredentials.clientId.isEmpty else { return }
-            store.saveJamfCredentials()
+            store.persistJamfCredentialsToKeychain()
             isSavedToKeychain = true
+        }
+
+        revalidationTask?.cancel()
+        revalidationTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            guard !store.jamfCredentials.url.isEmpty || !store.jamfCredentials.clientId.isEmpty else { return }
+            store.saveJamfCredentials()
         }
     }
 
@@ -472,6 +492,7 @@ struct JamfCredentialsPanel: View {
                 Spacer()
                 Button {
                     autoSaveTask?.cancel()
+                    revalidationTask?.cancel()
                     store.saveJamfCredentials()
                     isSavedToKeychain = true
                     Task {

@@ -43,25 +43,34 @@ enum EnvironmentSyncStatus: String, Codable {
   case cancelled // S7: last sync stopped by the user
   case running   // sync in progress
 
+  // Fix: this used to redeclare its own icon/color mapping instead of routing
+  // through SyncOutcome's — the two had already drifted (.error showed
+  // xmark.circle.fill on the Sync tab via SyncOutcome.failed.symbol, but
+  // exclamationmark.circle.fill here in the sidebar, for the identical failed
+  // run). ARCHITECTURE.md's S7 section says the sidebar renders through "the
+  // same helper" as the Sync tab banner precisely so that can't happen. .never
+  // and .running have no SyncOutcome equivalent (a run in progress or one that
+  // hasn't happened yet isn't a terminal outcome) and keep their own values;
+  // every terminal case now delegates to SyncOutcome so they can't diverge again.
   var icon: String {
     switch self {
     case .never:     return "circle"
-    case .success:   return "checkmark.circle.fill"
-    case .partial:   return "exclamationmark.triangle.fill"
-    case .error:     return "exclamationmark.circle.fill"
-    case .cancelled: return "stop.circle.fill"
     case .running:   return "arrow.triangle.2.circlepath.circle.fill"
+    case .success:   return SyncOutcome.success.symbol
+    case .partial:   return SyncOutcome.partial.symbol
+    case .error:     return SyncOutcome.failed.symbol
+    case .cancelled: return SyncOutcome.cancelled.symbol
     }
   }
 
   var color: Color {
     switch self {
     case .never:     return .secondary
-    case .success:   return .green
-    case .partial:   return .orange
-    case .error:     return .red
-    case .cancelled: return .secondary
     case .running:   return .accentColor
+    case .success:   return SyncOutcome.success.tint
+    case .partial:   return SyncOutcome.partial.tint
+    case .error:     return SyncOutcome.failed.tint
+    case .cancelled: return SyncOutcome.cancelled.tint
     }
   }
 }
@@ -292,7 +301,15 @@ final class EnvironmentStore: ObservableObject {
       }
     }
 
-    let persistence  = PersistenceController(environmentId: env.id)
+    // Reuse the already-loaded store for this environment when one is still
+    // alive (e.g. a running sync's captured `store:` keeps its
+    // PersistenceController retained even after the user switches away and
+    // back). Building a second PersistenceController here would silently
+    // overwrite the registry entry (PersistenceController.init registers
+    // unconditionally) and orphan the instance the running sync is still
+    // writing through — the UI would then show a second, inert store while
+    // writes land somewhere it never reads from.
+    let persistence  = PersistenceController.loadedStore(for: env.id) ?? PersistenceController(environmentId: env.id)
     let prefs        = AppPreferences(environmentId: env.id)
     let logService   = LogService.makeForEnvironment(id: env.id)
     activeStore      = AppStore(environment: env, persistence: persistence, prefs: prefs)

@@ -272,7 +272,12 @@ final class SyncEngine: ObservableObject {
         log.debug("AxM Client ID  : \(axmCreds.clientId.isEmpty ? "(not set)" : "(set)")")
         log.debug("AxM Key ID     : \(axmCreds.keyId.isEmpty ? "(not set)" : "(set)")")
         log.debug("AxM Private Key: \(axmCreds.privateKeyContent.isEmpty ? "(not set)" : "set (\(axmCreds.privateKeyContent.count) chars)")")
-        log.debug("Jamf URL       : \(jamfCreds.url.isEmpty ? "(not set)" : jamfCreds.url)")
+        // Fix: was logging the raw Jamf host, unlike every sibling credential
+        // line here — and DiagnosticsExporter.swift's header comment claims the
+        // exported bundle (which includes this log verbatim) "Never includes
+        // credentials or Jamf/Apple hosts." Mask it the same way as the fields
+        // around it so that claim is actually true.
+        log.debug("Jamf URL       : \(jamfCreds.url.isEmpty ? "(not set)" : "(set)")")
         log.debug("Jamf Client ID : \(jamfCreds.clientId.isEmpty ? "(not set)" : "(set)")")
         log.debug("Jamf Secret    : \(jamfCreds.clientSecret.isEmpty ? "(not set)" : "set (\(jamfCreds.clientSecret.count) chars)")")
         log.debug("── Cache Settings ──────────────────────────────────────")
@@ -475,7 +480,17 @@ final class SyncEngine: ObservableObject {
                             // fetchOrgDevices — the next run replays from the last committed
                             // batch (re-upserting a saved batch is idempotent by serial).
                             if !batch.isEmpty {
-                                let existingSnap   = await store.fetchAllDevicesForMerge()
+                                // Fix: this only ever needs to carry Jamf fields forward for
+                                // this batch's own serials — fetching and re-merging the
+                                // entire existing fleet here (fetchAllDevicesForMerge) meant
+                                // a full-table hydration every ~10 pages during pure ABM
+                                // pagination, each larger than the last as prior batches
+                                // landed. A serial-scoped fetch gets the same correctness
+                                // (every serial this merge could possibly touch) for a
+                                // fraction of the I/O, and upsertDevicesDurably below only
+                                // ever wrote this batch's own rows anyway.
+                                let batchSerials   = Set(batch.map(\.serialNumber))
+                                let existingSnap   = await store.fetchDevicesForMerge(serials: batchSerials)
                                 let jamfOriginSnap = store.jamfCredentials.canonicalOrigin
                                 let mergedBatch = await Task.detached(priority: .userInitiated) {
                                     mergeDevicesOffActor(abm: batch, jamf: [], mobile: [],
@@ -1805,6 +1820,15 @@ private func mergeDevicesOffActor(
                 jamfFileVaultStatus:  ex?.jamfFileVaultStatus,
                 jamfUsername:         ex?.jamfUsername,
                 jamfDeviceType:       axmDerivedDeviceType,
+                // Fix: this loop was omitting these 3 fields entirely, which the
+                // memberwise init defaults to nil — silently clearing a device's
+                // known MDM-server assignment on every ABM-only merge unless this
+                // run's fresh mdmServerLookup happens to re-cover the same serial.
+                // Carry the existing value forward, same as the pre-population loop
+                // above and the jamfValidationStatus fields just below.
+                assignedMdmServerId:  ex?.assignedMdmServerId,
+                assignedMdmServerName: ex?.assignedMdmServerName,
+                mdmServerType:        ex?.mdmServerType,
                 // S2: the ABM loop never confirms a Jamf mapping — carry the existing
                 // validation state forward untouched. The jamf loop below re-stamps it
                 // to .validated for any serial it actually re-matches against this host.

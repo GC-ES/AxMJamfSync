@@ -403,6 +403,27 @@ final class AppStore: ObservableObject {
         return true
     }
 
+    /// Shared MDM assigned/unassigned/named-server classification — was
+    /// duplicated verbatim in matchesDeviceFilters and matchesAxmDashboardFacets
+    /// (ARCHITECTURE.md: every per-device classification must live in exactly
+    /// one shared helper, precisely so a drill-down can never show a different
+    /// set of devices than the tapped count implied). jamfOnly devices are never
+    /// "assigned" — an AxM MDM-server assignment is an AxM-domain concept a
+    /// jamfOnly device has no real claim to, even if a stale mdmServerLookup
+    /// entry still names one (see the merge-time MDM patch in SyncEngine) —
+    /// matching the population guard matchesAxmDashboardFacets already applies.
+    private nonisolated static func matchesMdmFacet(_ d: Device, mdm: String?) -> Bool {
+        guard let mdm else { return true }
+        guard d.deviceSource != .jamfOnly else { return false }
+        if mdm == AppStore.mdmUnassignedSentinel {
+            return d.axmAssignmentStatus == "Unassigned"
+        } else if mdm == AppStore.mdmAssignedSentinel {
+            return d.axmAssignmentStatus != "Unassigned" && d.axmAssignmentStatus != nil
+        } else {
+            return d.assignedMdmServerName == mdm
+        }
+    }
+
     /// 4.2: single predicate for the Devices tab filters (dropdowns + search +
     /// Dashboard drill-down), shared by the debounced async path (`applyFilterNow`)
     /// and the synchronous mid-sync path (`applyFilterNowSync`) — those two had
@@ -418,15 +439,7 @@ final class AppStore: ObservableObject {
         if let src = source,   d.deviceSource  != src  { return false }
         if let cov = coverage, d.coverageStatus != cov  { return false }
         if let k   = kind,     d.deviceKind     != k    { return false }
-        if let mdm {
-            if mdm == AppStore.mdmUnassignedSentinel {
-                if d.axmAssignmentStatus != "Unassigned" { return false }
-            } else if mdm == AppStore.mdmAssignedSentinel {
-                if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
-            } else {
-                if d.assignedMdmServerName != mdm { return false }
-            }
-        }
+        guard Self.matchesMdmFacet(d, mdm: mdm) else { return false }
         if let wb {
             if d.deviceSource == .axmOnly { return false }
             if d.wbStatus != wb { return false }
@@ -554,6 +567,24 @@ final class AppStore: ObservableObject {
         return await ctx.perform {
             let req = CDDevice.fetchRequest()
             req.returnsObjectsAsFaults = false   // pre-fault all properties in one trip
+            let rows = (try? ctx.fetch(req)) ?? []
+            return rows.map { $0.toDevice() }
+        }
+    }
+
+    /// Same as fetchAllDevicesForMerge(), scoped to a specific set of serials.
+    /// Used for the S3 per-batch commit during ABM pagination: that merge only
+    /// ever touches the batch's own serials, so hydrating and re-merging every
+    /// other already-existing device on every batch (a full-table fetch every
+    /// ~10 pages) was pure waste — this fetches only the rows the batch's merge
+    /// actually needs to carry Jamf fields forward for.
+    func fetchDevicesForMerge(serials: Set<String>) async -> [Device] {
+        guard !serials.isEmpty else { return [] }
+        let ctx = persistence.newBackgroundContext()
+        return await ctx.perform {
+            let req = CDDevice.fetchRequest()
+            req.predicate = NSPredicate(format: "serialNumber IN %@", serials)
+            req.returnsObjectsAsFaults = false
             let rows = (try? ctx.fetch(req)) ?? []
             return rows.map { $0.toDevice() }
         }
@@ -874,9 +905,31 @@ final class AppStore: ObservableObject {
         stats = s
         // Also refresh filtered list after stats recalc (devices may have changed)
         applyFilterNow()
-        recomputeJamfDashboardStats()
-        recomputeAxmDashboardStats()
-        recomputeCommonDashboardStats()
+        scheduleDashboardFacetRecompute()
+    }
+
+    /// Fix: recomputeStats() is called from ~10 sites in SyncEngine's per-batch
+    /// flush loops — on a 21,000+ device sync that's hundreds of calls, each of
+    /// which used to unconditionally fan out into 3 more full O(n) filter+stats
+    /// passes (one per dashboard mode) regardless of whether anyone is looking at
+    /// a dashboard. Coalesce: a burst of calls within the same ~250ms window
+    /// schedules at most one deferred recompute, always reading the latest
+    /// `devices`/facet state when it actually runs, so dashboards mid-sync never
+    /// fall behind by more than ~250ms and the final state after a sync always
+    /// converges correctly. Facet-chip taps bypass this entirely — they call
+    /// recompute*DashboardStats() directly for instant feedback.
+    private var dashboardFacetRecomputeTask: Task<Void, Never>? = nil
+
+    private func scheduleDashboardFacetRecompute() {
+        guard dashboardFacetRecomputeTask == nil else { return }
+        dashboardFacetRecomputeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard let self else { return }
+            self.dashboardFacetRecomputeTask = nil
+            self.recomputeJamfDashboardStats()
+            self.recomputeAxmDashboardStats()
+            self.recomputeCommonDashboardStats()
+        }
     }
 
     /// A write-deferred binding to a facet property. SwiftUI's segmented `Picker`
@@ -987,15 +1040,7 @@ final class AppStore: ObservableObject {
         if let st = status,         (d.axmDeviceStatus?.uppercased() ?? "") != st          { return false }
         if let pf = productFamily,  Self.productFamilyLabel(for: d)         != pf           { return false }
         if let ps = purchaseSource, Self.purchaseSourceLabel(for: d)        != ps           { return false }
-        if let m = mdm {
-            if m == AppStore.mdmUnassignedSentinel {
-                if d.axmAssignmentStatus != "Unassigned" { return false }
-            } else if m == AppStore.mdmAssignedSentinel {
-                if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
-            } else if d.assignedMdmServerName != m {
-                return false
-            }
-        }
+        guard Self.matchesMdmFacet(d, mdm: mdm) else { return false }
         return true
     }
 
@@ -1087,16 +1132,23 @@ final class AppStore: ObservableObject {
             KeychainService.saveAxMCredentials(axmCredentials)
         }
     }
-    func saveJamfCredentials() {
-        // S2: capture the mapping-trust baseline BEFORE persisting the new values.
-        let newOrigin  = jamfCredentials.canonicalOrigin
-        let prevOrigin = prefs.jamfValidatedOrigin
-
+    /// Keychain write only — no origin comparison, no revalidation trigger. Safe
+    /// to call on every debounced keystroke while the user is still mid-edit;
+    /// see saveJamfCredentials() for why that isn't true of the full path.
+    func persistJamfCredentialsToKeychain() {
         if let envId = environmentId {
             KeychainService.saveJamfCredentialsForEnv(jamfCredentials, id: envId)
         } else {
             KeychainService.saveJamfCredentials(jamfCredentials)
         }
+    }
+
+    func saveJamfCredentials() {
+        // S2: capture the mapping-trust baseline BEFORE persisting the new values.
+        let newOrigin  = jamfCredentials.canonicalOrigin
+        let prevOrigin = prefs.jamfValidatedOrigin
+
+        persistJamfCredentialsToKeychain()
 
         // A blank previous origin means there was nothing to invalidate yet (brand-new
         // environment). Just record the baseline. Also covers the first save on the

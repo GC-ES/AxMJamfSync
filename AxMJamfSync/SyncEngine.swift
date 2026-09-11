@@ -28,6 +28,13 @@ final class SyncEngine: ObservableObject {
     // S7: four-state result of the most recent finished run. Never `.success`
     // unless every stage completed and persisted. Restored from prefs in init().
     @Published var lastOutcome: SyncOutcome = .success
+    // 3.5: true from the moment a run finishes with a non-success outcome until
+    // the user actually opens the Sync tab (ContentView calls markOutcomeSeen()
+    // on tab selection) — drives the red dot on the Sync tab icon. Session-local,
+    // not persisted: restored true-or-false from the last known outcome at
+    // launch, but a relaunch always starts "unseen" for anything but success.
+    @Published var hasUnviewedIssue: Bool = false
+    func markOutcomeSeen() { hasUnviewedIssue = false }
 
     // Last-run summary counts (shown in SyncView after completion)
     @Published var lastRunAxm:      String = "—"
@@ -74,27 +81,42 @@ final class SyncEngine: ObservableObject {
     private var coverageStartIndex: Int = 0
     private var stepStartTime: Date?
 
-    // MARK: - Init — restore last run summary from UserDefaults
-
-    init() {
-        let ud = UserDefaults.standard
-        if let raw = ud.string(forKey: PrefKey.lrOutcome),
-           let o = SyncOutcome(rawValue: raw) { lastOutcome = o }
-        let epoch = ud.double(forKey: PrefKey.lrDateEpoch)
-        guard epoch > 0 else { return }   // no previous run recorded
-        let secs = ud.integer(forKey: PrefKey.lrElapsedSecs)
-        lastRunDate        = Date(timeIntervalSince1970: epoch)
-        lastRunElapsedSecs = secs
-        lastRunElapsed     = secs >= 60 ? "\(secs/60)m \(secs%60)s" : "\(secs)s"
-        lastRunAxmCount    = ud.integer(forKey: PrefKey.lrAxmCount)
-        lastRunJamfCount   = ud.integer(forKey: PrefKey.lrJamfCount)
-        lastRunFromCache   = ud.integer(forKey: PrefKey.lrFromCache)
-        lastRunCovActive   = ud.integer(forKey: PrefKey.lrCovActive)
-        lastRunCovInactive = ud.integer(forKey: PrefKey.lrCovInactive)
-        lastRunCovNone     = ud.integer(forKey: PrefKey.lrCovNone)
-        lastRunCovFetched  = ud.integer(forKey: PrefKey.lrCovFetched)
-        lastRunWBSynced    = ud.integer(forKey: PrefKey.lrWBSynced)
-        lastRunWBFailed    = ud.integer(forKey: PrefKey.lrWBFailed)
+    // MARK: - Restore last run summary
+    //
+    // Deliberately NOT done in init(). A SyncEngine is constructed with the
+    // plain no-arg init (Swift's implicit one — every stored property already
+    // has a default) before its `environmentId` is known: EnvironmentStore's
+    // own @Published placeholder is `SyncEngine()`, and buildServices() only
+    // sets `environmentId` as a second step. Reading UserDefaults.standard
+    // directly inside init() — the previous design — read FLAT, unnamespaced
+    // `PrefKey.lr*` keys, while every *write* of these same values goes
+    // through `store.prefs.lr*`, which IS environment-namespaced
+    // (`AppPreferences`'s `k(_:)` prefixes with `env.{uuid}.` for every
+    // environment except Default). So every non-Default environment's fresh
+    // engine restored whatever the flat keys happened to hold — effectively
+    // Default's last summary, or zeros — never its own. restoreLastRun(from:)
+    // is called by EnvironmentStore.buildServices() once `environmentId` is
+    // set and this environment's own `AppPreferences` instance exists, so the
+    // read side finally matches the write side's namespacing.
+    func restoreLastRun(from prefs: AppPreferences) {
+        if let o = SyncOutcome(rawValue: prefs.lrOutcome) { lastOutcome = o; hasUnviewedIssue = o != .success }
+        guard prefs.lrDateEpoch > 0 else { return }   // no previous run recorded
+        lastRunDate        = Date(timeIntervalSince1970: prefs.lrDateEpoch)
+        lastRunElapsedSecs = prefs.lrElapsedSecs
+        lastRunElapsed     = lastRunElapsedSecs >= 60 ? "\(lastRunElapsedSecs/60)m \(lastRunElapsedSecs%60)s" : "\(lastRunElapsedSecs)s"
+        lastRunAxmCount    = prefs.lrAxmCount
+        lastRunJamfCount   = prefs.lrJamfCount
+        lastRunFromCache   = prefs.lrFromCache
+        lastRunCovActive   = prefs.lrCovActive
+        lastRunCovInactive = prefs.lrCovInactive
+        lastRunCovNone     = prefs.lrCovNone
+        lastRunCovFetched  = prefs.lrCovFetched
+        lastRunWBSynced    = prefs.lrWBSynced
+        lastRunWBFailed    = prefs.lrWBFailed
+        lastRunWBSyncedMac = prefs.lrWBSyncedMac
+        lastRunWBFailedMac = prefs.lrWBFailedMac
+        lastRunWBSyncedMob = prefs.lrWBSyncedMob
+        lastRunWBFailedMob = prefs.lrWBFailedMob
         // Reconstruct text summary lines
         lastRunAxm      = lastRunAxmCount  > 0 ? "\(lastRunAxmCount) fetched"  : "cached"
         lastRunJamf     = lastRunJamfCount > 0 ? "\(lastRunJamfCount) fetched" : "cached"
@@ -194,6 +216,7 @@ final class SyncEngine: ObservableObject {
             tabBadge = ""
             NSApp.dockTile.badgeLabel = nil
             lastOutcome = .failed
+            hasUnviewedIssue = true
             onSyncStatusChange?(.error, Date())
         }
         guard let envId = store.environmentId else {
@@ -297,6 +320,7 @@ final class SyncEngine: ObservableObject {
             phase       = outcome == .failed ? .error : .done
             lastError   = message
             lastOutcome = outcome
+            hasUnviewedIssue = outcome != .success
             stepLabel   = "\(outcome.label): \(message)"
             store.prefs.lrOutcome = outcome.rawValue
             log.error(message)
@@ -777,7 +801,10 @@ final class SyncEngine: ObservableObject {
                 log.info("Step 3/4 — Coverage cache fresh and all devices fetched — skipping.")
             } else {
                 phase = .coverage; stepStartTime = Date(); stepElapsed = ""
-                NSApp.dockTile.badgeLabel = "3/4"; NSApp.requestUserAttention(.informationalRequest)
+                // 4.5: no attention-request here — a mid-run step transition isn't
+                // something the user needs to be pulled back to the app for; the
+                // Dock badge alone is enough progress signal.
+                NSApp.dockTile.badgeLabel = "3/4"
 
                 // forceCoverage = ON  → ALL eligible devices are re-fetched and re-patched,
                 //                      ignoring cache timestamps entirely. This is a full
@@ -1028,7 +1055,7 @@ final class SyncEngine: ObservableObject {
 
             // ── Step 4: Jamf Write-back ──────────────────────────────────
             phase = .jamfUpdate; stepStartTime = Date(); stepElapsed = ""
-                NSApp.dockTile.badgeLabel = "4/4"; NSApp.requestUserAttention(.informationalRequest)
+                NSApp.dockTile.badgeLabel = "4/4"
             // Exclude AxM-only devices from Jamf Update — they have no jamfId.
             // When a full device sync later classifies them as .both, wbStatus resets to .pending.
             // Only write back devices that have real coverage data.
@@ -1381,10 +1408,15 @@ final class SyncEngine: ObservableObject {
                 store.prefs.lrCovFetched  = lastRunCovFetched
                 store.prefs.lrWBSynced    = lastRunWBSynced
                 store.prefs.lrWBFailed    = lastRunWBFailed
+                store.prefs.lrWBSyncedMac = lastRunWBSyncedMac
+                store.prefs.lrWBFailedMac = lastRunWBFailedMac
+                store.prefs.lrWBSyncedMob = lastRunWBSyncedMob
+                store.prefs.lrWBFailedMob = lastRunWBFailedMob
                 store.prefs.lrOutcome     = outcome.rawValue
             }
 
-            lastOutcome = outcome
+            lastOutcome      = outcome
+            hasUnviewedIssue = outcome != .success
             phase       = outcome == .failed ? .error : .done
             tabBadge    = ""
             onSyncStatusChange?(outcome.environmentStatus, Date())
@@ -1475,6 +1507,7 @@ final class SyncEngine: ObservableObject {
             phase       = .idle
             stepLabel   = "Stopped."
             lastOutcome = .cancelled
+            hasUnviewedIssue = true
             store.prefs.lrOutcome = SyncOutcome.cancelled.rawValue
             onSyncStatusChange?(.cancelled, Date())
             log.warn("Sync cancelled by user.")
@@ -1519,6 +1552,10 @@ final class SyncEngine: ObservableObject {
                 store.prefs.lrCovFetched  = lastRunCovFetched
                 store.prefs.lrWBSynced    = lastRunWBSynced
                 store.prefs.lrWBFailed    = lastRunWBFailed
+                store.prefs.lrWBSyncedMac = lastRunWBSyncedMac
+                store.prefs.lrWBFailedMac = lastRunWBFailedMac
+                store.prefs.lrWBSyncedMob = lastRunWBSyncedMob
+                store.prefs.lrWBFailedMob = lastRunWBFailedMob
             }
 
             // ── Flush partial coverage batch (Stop mid-Step 3) ─────────────

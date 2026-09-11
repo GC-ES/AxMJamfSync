@@ -6,8 +6,9 @@
 // scheduled run behaves identically to tapping "Sync All": one environment at a
 // time, no parallel Apple/Jamf API calls.
 //
-// Trigger model: in-process poll loop (a single Task sleeping 30s at a time,
-// comparing wall-clock Date() against a persisted nextFireDate) paired with
+// Trigger model: in-process poll loop (a single Task sleeping until nextFireDate
+// or 5 minutes, whichever is sooner, then comparing wall-clock Date() against a
+// persisted nextFireDate) paired with
 // "Launch at Login" via SMAppService. This only fires while the app process is
 // alive — if the app is force-quit, scheduled syncs resume on next launch rather
 // than running while fully closed. That trade-off avoids a second XPC/helper
@@ -159,9 +160,20 @@ final class SyncScheduler: ObservableObject {
       while !Task.isCancelled {
         guard let self else { return }
         await self.checkDue()
-        try? await Task.sleep(for: .seconds(30))
+        guard !Task.isCancelled else { return }
+        try? await Task.sleep(for: .seconds(self.nextPollDelay()))
       }
     }
+  }
+
+  /// 4.15: sleep only as long as needed to reach `nextFireDate`, capped at 5
+  /// minutes — replaces a fixed 30s poll that burned wakeups for hours at a
+  /// time whenever the next scheduled run was far off. Floored at 5s so a
+  /// due-or-overdue date (remaining <= 0) doesn't spin the loop tightly;
+  /// `checkDue` fires on the very next iteration either way.
+  private func nextPollDelay() -> Double {
+    guard let next = nextFireDate else { return 300 }
+    return min(max(next.timeIntervalSinceNow, 5), 300)
   }
 
   private func checkDue() async {

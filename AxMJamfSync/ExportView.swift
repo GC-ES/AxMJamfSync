@@ -1,8 +1,12 @@
 // ExportView.swift
 // Export tab — CSV export of filtered or all devices.
-// Column selection persisted to UserDefaults via AppStore.saveExportColumns().
+// Column selection AND order persisted to UserDefaults via
+// AppStore.saveExportColumns() (wired to fire on every change — see 6.3).
+// Filename: AxM-Jamf-Sync_{environment}_{preset}_{date}.csv. Success banner
+// offers Show in Finder for the file just saved.
 
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
 // MARK: - Export preset
@@ -52,6 +56,26 @@ private func buildPresets(store: AppStore) -> [ExportPreset] {
             title: "Out of Warranty", icon: "shield.slash", color: .secondary,
             count: s.exportCovInactiveCount,
             devices: { $0.devices.filter { [.inactive, .expired, .cancelled].contains($0.coverageStatus) } }),
+        // 6.2: the exports admins actually reach for to email someone — reuse
+        // the same expiringWindowLabel/wbStatus classification the Dashboard's
+        // own "Expiring Soon" cards and Jamf Update breakdown use, so a preset's
+        // count can never disagree with the equivalent Dashboard number.
+        ExportPreset(id: "expiring_30",
+            title: "Expiring in 30 Days", icon: "exclamationmark.shield.fill", color: .red,
+            count: s.axmExpiring30,
+            devices: { $0.devices.filter { AppStore.expiringWindowLabel(for: $0) == "0–30" } }),
+        ExportPreset(id: "expiring_60",
+            title: "Expiring in 31–60 Days", icon: "clock.badge.exclamationmark.fill", color: .orange,
+            count: s.axmExpiring60,
+            devices: { $0.devices.filter { AppStore.expiringWindowLabel(for: $0) == "31–60" } }),
+        ExportPreset(id: "expiring_90",
+            title: "Expiring in 61–90 Days", icon: "clock.fill", color: .yellow,
+            count: s.axmExpiring90,
+            devices: { $0.devices.filter { AppStore.expiringWindowLabel(for: $0) == "61–90" } }),
+        ExportPreset(id: "wb_failed",
+            title: "Write-back Failed", icon: "xmark.circle.fill", color: .red,
+            count: s.wbFailed,
+            devices: { $0.devices.filter { $0.wbStatus == .failed } }),
         ExportPreset(id: "filtered",
             title: "Current Filter", icon: "line.3.horizontal.decrease.circle.fill", color: .purple,
             count: store.filteredDevices.count,
@@ -62,7 +86,8 @@ private func buildPresets(store: AppStore) -> [ExportPreset] {
 // MARK: - ExportView
 
 struct ExportView: View {
-    @EnvironmentObject private var store: AppStore
+    @EnvironmentObject private var store:    AppStore
+    @EnvironmentObject private var envStore: EnvironmentStore
     @State private var selectedPresetId: String        = "all"
     @State private var csvDocument:      CSVDocument?  = nil
     @State private var showFilePicker    = false
@@ -70,7 +95,9 @@ struct ExportView: View {
     @State private var exportResult:     ExportResult? = nil
 
     enum ExportResult {
-        case success(String), failure(String)
+        // 6.1: success carries the saved file's URL so the banner can offer
+        // Show in Finder — landing a CSV with no way back to it was a dead end.
+        case success(String, URL), failure(String)
     }
 
     private var presets: [ExportPreset] { buildPresets(store: store) }
@@ -125,18 +152,30 @@ struct ExportView: View {
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                                 Divider()
-                                ScrollView {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        ForEach($store.exportColumns) { $col in
-                                            ExportColumnRow(column: $col)
-                                        }
+                                // 6.3: a List (not ScrollView+VStack) so .onMove gives
+                                // drag-to-reorder — CSV column order matters and this
+                                // is the only way to control it short of re-exporting
+                                // and reordering in a spreadsheet afterward.
+                                List {
+                                    ForEach($store.exportColumns) { $col in
+                                        ExportColumnRow(column: $col)
                                     }
-                                }.frame(height: 280)
+                                    .onMove { indices, newOffset in
+                                        store.exportColumns.move(fromOffsets: indices, toOffset: newOffset)
+                                    }
+                                }
+                                .listStyle(.plain)
+                                .frame(height: 280)
                             }
                         } label: {
                             Label("Columns to Include", systemImage: "tablecells")
                                 .font(.headline)
                         }
+                        // 6.3: persists both the enabled flags and their order — this
+                        // was previously never wired up at all (AppStore.saveExportColumns()
+                        // existed but no view ever called it, so column selection didn't
+                        // survive a relaunch even before reordering existed).
+                        .onChange(of: store.exportColumns) { _, _ in store.saveExportColumns() }
                     }
                     .frame(maxWidth: .infinity)
 
@@ -178,7 +217,7 @@ struct ExportView: View {
                                 HStack(spacing: 12) {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(selectedPreset.title).font(.headline)
-                                        Text("\(exportCount) device\(exportCount == 1 ? "" : "s")  ·  \(store.exportColumns.filter(\.enabled).count) columns")
+                                        Text("^[\(exportCount) device](inflect: true)  ·  ^[\(store.exportColumns.filter(\.enabled).count) column](inflect: true)")
                                             .font(.callout).foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -218,7 +257,7 @@ struct ExportView: View {
                                     defaultFilename: defaultFilename()
                                 ) { result in
                                     switch result {
-                                    case .success(let url): exportResult = .success("Saved to \(url.lastPathComponent)")
+                                    case .success(let url): exportResult = .success("Saved to \(url.lastPathComponent)", url)
                                     case .failure(let err): exportResult = .failure(err.localizedDescription)
                                     }
                                     csvDocument = nil
@@ -240,9 +279,17 @@ struct ExportView: View {
         .background(.background)
     }
 
+    // 6.4: named after the environment, not just the preset — an MSP exporting
+    // from three tenants back-to-back previously got three files all named
+    // "device_report_all_2026-09-11" and had to rename them by hand to tell
+    // them apart.
     private func defaultFilename() -> String {
         let date = ISO8601DateFormatter().string(from: Date()).prefix(10)
-        return "device_report_\(selectedPreset.id)_\(date)"
+        let envName = envStore.activeEnvironment?.name ?? "AxMJamfSync"
+        // Strip characters that are invalid (or awkward) in a filename —
+        // "/" and ":" can't appear at all on macOS, "\" just invites confusion.
+        let safeEnvName = envName.components(separatedBy: CharacterSet(charactersIn: "/:\\")).joined()
+        return "AxM-Jamf-Sync_\(safeEnvName)_\(selectedPreset.id)_\(date)"
     }
 }
 
@@ -268,7 +315,7 @@ private struct ExportPresetTile: View {
                     Text(preset.title)
                         .font(.callout).fontWeight(.medium)
                         .foregroundStyle(isSelected ? preset.color : .primary)
-                    Text("\(preset.count) device\(preset.count == 1 ? "" : "s")")
+                    Text("^[\(preset.count) device](inflect: true)")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -297,6 +344,12 @@ struct ExportColumnRow: View {
     @Binding var column: ExportColumn
     var body: some View {
         HStack {
+            // 6.3: visual affordance for drag-to-reorder — macOS Lists with
+            // .onMove are already draggable without it, but an unlabeled row
+            // gives no hint that order is meaningful (and now persisted).
+            Image(systemName: "line.3.horizontal")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             Toggle(isOn: $column.enabled) {
                 Text(column.label).font(.callout)
             }
@@ -315,7 +368,11 @@ struct ExportResultBanner: View {
 
     var isSuccess: Bool { if case .success = result { return true }; return false }
     var message: String {
-        switch result { case .success(let m): return m; case .failure(let m): return m }
+        switch result { case .success(let m, _): return m; case .failure(let m): return m }
+    }
+    var savedURL: URL? {
+        if case .success(_, let url) = result { return url }
+        return nil
     }
 
     var body: some View {
@@ -324,6 +381,15 @@ struct ExportResultBanner: View {
                 .foregroundStyle(isSuccess ? .green : .red)
             Text(message).font(.callout).foregroundStyle(isSuccess ? .green : .red)
             Spacer()
+            if let savedURL {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([savedURL])
+                } label: {
+                    Label("Show in Finder", systemImage: "folder")
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            }
             Button { onDismiss() } label: {
                 Image(systemName: "xmark").font(.caption).foregroundStyle(.secondary)
             }.buttonStyle(.plain).help("Dismiss this message")

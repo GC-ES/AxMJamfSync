@@ -44,6 +44,12 @@ enum PrefKey {
     static let lrCovFetched           = "lrCovFetched"
     static let lrWBSynced             = "lrWBSynced"
     static let lrWBFailed             = "lrWBFailed"
+    // 3.2: Mac/Mobile split of the write-back counters above, for the Sync tab's
+    // per-tile subtitle breakdown.
+    static let lrWBSyncedMac          = "lrWBSyncedMac"
+    static let lrWBFailedMac          = "lrWBFailedMac"
+    static let lrWBSyncedMob          = "lrWBSyncedMob"
+    static let lrWBFailedMob          = "lrWBFailedMob"
     // S7: raw value of the last run's SyncOutcome (success/partial/failed/cancelled).
     static let lrOutcome              = "lrOutcome"
     static let activeScope            = "activeScope"
@@ -234,6 +240,22 @@ final class AppPreferences: ObservableObject {
         get { int(PrefKey.lrWBFailed, default: 0) }
         set { ud.set(newValue, forKey: k(PrefKey.lrWBFailed)); objectWillChange.send() }
     }
+    var lrWBSyncedMac: Int {
+        get { int(PrefKey.lrWBSyncedMac, default: 0) }
+        set { ud.set(newValue, forKey: k(PrefKey.lrWBSyncedMac)); objectWillChange.send() }
+    }
+    var lrWBFailedMac: Int {
+        get { int(PrefKey.lrWBFailedMac, default: 0) }
+        set { ud.set(newValue, forKey: k(PrefKey.lrWBFailedMac)); objectWillChange.send() }
+    }
+    var lrWBSyncedMob: Int {
+        get { int(PrefKey.lrWBSyncedMob, default: 0) }
+        set { ud.set(newValue, forKey: k(PrefKey.lrWBSyncedMob)); objectWillChange.send() }
+    }
+    var lrWBFailedMob: Int {
+        get { int(PrefKey.lrWBFailedMob, default: 0) }
+        set { ud.set(newValue, forKey: k(PrefKey.lrWBFailedMob)); objectWillChange.send() }
+    }
     var lrOutcome: String {
         get { string(PrefKey.lrOutcome, default: SyncOutcome.success.rawValue) }
         set { ud.set(newValue, forKey: k(PrefKey.lrOutcome)); objectWillChange.send() }
@@ -256,20 +278,57 @@ final class AppPreferences: ObservableObject {
 
     var lastRunDate: Date? { lrDateEpoch > 0 ? Date(timeIntervalSince1970: lrDateEpoch) : nil }
 
+    // 6.3: {id, enabled} pairs IN ORDER — order is now persisted, not just
+    // which columns are enabled. A plain [String: Bool] dict (the pre-6.3
+    // format) has no order to lose, so the old shape is kept as a fallback
+    // decode in loadExportColumns() rather than migrated — the two are
+    // distinguished purely by which one successfully decodes.
+    private struct StoredColumnState: Codable {
+        let id: String
+        let enabled: Bool
+    }
+
     func saveExportColumns(_ columns: [ExportColumn]) {
-        let dict = Dictionary(uniqueKeysWithValues: columns.map { ($0.id, $0.enabled) })
-        if let json = try? JSONEncoder().encode(dict),
+        let ordered = columns.map { StoredColumnState(id: $0.id, enabled: $0.enabled) }
+        if let json = try? JSONEncoder().encode(ordered),
            let str  = String(data: json, encoding: .utf8) {
             exportColumnJSON = str
         }
     }
 
-    func loadExportColumnEnabled() -> [String: Bool] {
-        guard !exportColumnJSON.isEmpty,
-              let data = exportColumnJSON.data(using: .utf8),
-              let dict = try? JSONDecoder().decode([String: Bool].self, from: data)
-        else { return [:] }
-        return dict
+    /// Returns the full ordered column list: the persisted order when one
+    /// exists, falling back to `ExportColumn.defaultColumns`' fixed order with
+    /// just the enabled flags overlaid when reading a pre-6.3 save (or nothing
+    /// saved yet). Any column id from a pre-6.3/newer save that no longer
+    /// exists in `defaultColumns` is silently dropped; any column
+    /// `defaultColumns` has gained since the save is appended at the end so an
+    /// app update never hides a new column just because an old save predates it.
+    func loadExportColumns() -> [ExportColumn] {
+        guard !exportColumnJSON.isEmpty, let data = exportColumnJSON.data(using: .utf8) else {
+            return ExportColumn.defaultColumns
+        }
+        if let ordered = try? JSONDecoder().decode([StoredColumnState].self, from: data) {
+            let defaults = Dictionary(uniqueKeysWithValues: ExportColumn.defaultColumns.map { ($0.id, $0) })
+            var seen: Set<String> = []
+            var result: [ExportColumn] = ordered.compactMap { entry in
+                guard let base = defaults[entry.id] else { return nil }
+                seen.insert(entry.id)
+                return ExportColumn(id: base.id, label: base.label, enabled: entry.enabled)
+            }
+            for col in ExportColumn.defaultColumns where !seen.contains(col.id) {
+                result.append(col)
+            }
+            return result
+        }
+        // Pre-6.3 format: a flat [String: Bool] dict, no order.
+        if let dict = try? JSONDecoder().decode([String: Bool].self, from: data) {
+            return ExportColumn.defaultColumns.map { col in
+                var c = col
+                if let on = dict[col.id] { c.enabled = on }
+                return c
+            }
+        }
+        return ExportColumn.defaultColumns
     }
 
     // MARK: - Cursor resume state

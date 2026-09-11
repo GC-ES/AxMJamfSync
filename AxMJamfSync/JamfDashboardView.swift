@@ -296,7 +296,7 @@ private struct JamfDashboardFacetBar: View {
           if let ck = store.jamfDashboardCheckinFacet {
             FacetActiveChip(label: ck) { store.jamfDashboardCheckinFacet = nil }
           }
-          Text("\(matchCount) device\(matchCount == 1 ? "" : "s") match")
+          Text("^[\(matchCount) device](inflect: true) match")
             .font(.caption)
             .foregroundStyle(.secondary)
           Button("Clear All") { store.clearJamfDashboardFacets() }

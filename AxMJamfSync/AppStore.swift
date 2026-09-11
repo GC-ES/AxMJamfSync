@@ -205,10 +205,7 @@ final class AppStore: ObservableObject {
         self.axmCredentials  = KeychainService.loadAxMCredentials()
         self.jamfCredentials = KeychainService.loadJamfCredentials()
 
-        let saved = self.prefs.loadExportColumnEnabled()
-        exportColumns = ExportColumn.defaultColumns.map { col in
-            var c = col; if let on = saved[col.id] { c.enabled = on }; return c
-        }
+        exportColumns = self.prefs.loadExportColumns()
 
         // Synchronous CoreData row count — sets cacheIsPopulated and activeScope
         // BEFORE the async loadDevicesFromCoreData completes, so scope-lock UI
@@ -290,10 +287,7 @@ final class AppStore: ObservableObject {
             prefs.jamfValidatedOrigin = jamfCredentials.canonicalOrigin
         }
 
-        let saved = prefs.loadExportColumnEnabled()
-        exportColumns = ExportColumn.defaultColumns.map { col in
-            var c = col; if let on = saved[col.id] { c.enabled = on }; return c
-        }
+        exportColumns = prefs.loadExportColumns()
 
         let ctx       = persistence.viewContext
         let countReq  = NSFetchRequest<NSNumber>(entityName: "CDDevice")
@@ -409,6 +403,53 @@ final class AppStore: ObservableObject {
         return true
     }
 
+    /// 4.2: single predicate for the Devices tab filters (dropdowns + search +
+    /// Dashboard drill-down), shared by the debounced async path (`applyFilterNow`)
+    /// and the synchronous mid-sync path (`applyFilterNowSync`) — those two had
+    /// silently drifted (one searched 2 model fields, the other 3). Never
+    /// reimplement this filter inline at a third call site.
+    private nonisolated static func matchesDeviceFilters(_ d: Device,
+        source: DeviceSource?, coverage: CoverageStatus?, kind: DeviceKind?, mdm: String?,
+        wb: WBStatus?, searchText: String, noDrillDown: Bool,
+        axmStatus: String?, productFamily: String?, purchaseSource: String?,
+        addedToOrgYear: String?, jamfManaged: Bool?, osVersion: String?,
+        fileVault: String?, checkin: String?, expiringWindow: String?
+    ) -> Bool {
+        if let src = source,   d.deviceSource  != src  { return false }
+        if let cov = coverage, d.coverageStatus != cov  { return false }
+        if let k   = kind,     d.deviceKind     != k    { return false }
+        if let mdm {
+            if mdm == AppStore.mdmUnassignedSentinel {
+                if d.axmAssignmentStatus != "Unassigned" { return false }
+            } else if mdm == AppStore.mdmAssignedSentinel {
+                if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
+            } else {
+                if d.assignedMdmServerName != mdm { return false }
+            }
+        }
+        if let wb {
+            if d.deviceSource == .axmOnly { return false }
+            if d.wbStatus != wb { return false }
+        }
+        if !searchText.isEmpty {
+            // 5.1: matched fields beyond serial/name/model — username, Jamf ID,
+            // AppleCare agreement #, MDM server, order number, model identifier.
+            // Collected into one array rather than a chain of individual
+            // `?? "" .contains` checks so adding a future field is a one-line diff.
+            let haystacks = [
+                d.serialNumber, d.jamfName, d.jamfModel, d.axmModel, d.axmDeviceModel,
+                d.jamfUsername, d.jamfId, d.axmAgreementNumber, d.assignedMdmServerName,
+                d.axmOrderNumber, d.jamfModelIdentifier
+            ]
+            guard haystacks.contains(where: { $0?.lowercased().contains(searchText) == true }) else { return false }
+        }
+        if !noDrillDown, !Self.matchesDrillDownFilters(d,
+            axmStatus: axmStatus, productFamily: productFamily, purchaseSource: purchaseSource,
+            addedToOrgYear: addedToOrgYear, jamfManaged: jamfManaged, osVersion: osVersion,
+            fileVault: fileVault, checkin: checkin, expiringWindow: expiringWindow) { return false }
+        return true
+    }
+
     private func applyFilterNowSync() {
         let snapshot   = devices
         let srcFilter  = deviceSourceFilter
@@ -434,35 +475,11 @@ final class AppStore: ObservableObject {
             result = snapshot
         } else {
             result = snapshot.filter { d in
-                if let src  = srcFilter,  d.deviceSource  != src          { return false }
-                if let cov  = covFilter,  d.coverageStatus != cov         { return false }
-                if let kind = typeFilter, d.deviceKind    != kind         { return false }
-                if let mdm = mdmFilter {
-                    if mdm == AppStore.mdmUnassignedSentinel {
-                        if d.axmAssignmentStatus != "Unassigned" { return false }
-                    } else if mdm == AppStore.mdmAssignedSentinel {
-                        if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
-                    } else {
-                        if d.assignedMdmServerName != mdm { return false }
-                    }
-                }
-                if let wb = wbF {
-                    if d.deviceSource == .axmOnly { return false }
-                    if d.wbStatus != wb { return false }
-                }
-                if !searchText.isEmpty {
-                    let serial = d.serialNumber.lowercased()
-                    let name   = d.jamfName?.lowercased()  ?? ""
-                    let model  = (d.jamfModel ?? d.axmModel)?.lowercased() ?? ""
-                    if !serial.contains(searchText) &&
-                       !name.contains(searchText)   &&
-                       !model.contains(searchText)  { return false }
-                }
-                if !noDrillDown, !Self.matchesDrillDownFilters(d,
+                Self.matchesDeviceFilters(d, source: srcFilter, coverage: covFilter, kind: typeFilter,
+                    mdm: mdmFilter, wb: wbF, searchText: searchText, noDrillDown: noDrillDown,
                     axmStatus: axmStatusF, productFamily: familyF, purchaseSource: purchaseF,
                     addedToOrgYear: yearF, jamfManaged: managedF, osVersion: osVerF,
-                    fileVault: fvF, checkin: checkinF, expiringWindow: expiringF) { return false }
-                return true
+                    fileVault: fvF, checkin: checkinF, expiringWindow: expiringF)
             }
         }
         filteredDevices  = result
@@ -603,35 +620,11 @@ final class AppStore: ObservableObject {
                 result = snapshot
             } else {
                 result = snapshot.filter { d in
-                    if let src  = srcFilter,  d.deviceSource  != src  { return false }
-                    if let cov  = covFilter,  d.coverageStatus != cov  { return false }
-                    if let kind = typeFilter, d.deviceKind    != kind  { return false }
-                    if let mdm = mdmFilter {
-                        if mdm == AppStore.mdmUnassignedSentinel {
-                            if d.axmAssignmentStatus != "Unassigned" { return false }
-                        } else if mdm == AppStore.mdmAssignedSentinel {
-                            if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
-                        } else {
-                            if d.assignedMdmServerName != mdm { return false }
-                        }
-                    }
-                    if let wb = wbF {
-                        if d.deviceSource == .axmOnly { return false }
-                        if d.wbStatus != wb { return false }
-                    }
-                    if !searchText.isEmpty {
-                        let serial = d.serialNumber.lowercased()
-                        let name   = d.jamfName?.lowercased()  ?? ""
-                        let model  = (d.jamfModel ?? d.axmModel ?? d.axmDeviceModel)?.lowercased() ?? ""
-                        if !serial.contains(searchText) &&
-                           !name.contains(searchText)   &&
-                           !model.contains(searchText)  { return false }
-                    }
-                    if !noDrillDown, !AppStore.matchesDrillDownFilters(d,
+                    AppStore.matchesDeviceFilters(d, source: srcFilter, coverage: covFilter, kind: typeFilter,
+                        mdm: mdmFilter, wb: wbF, searchText: searchText, noDrillDown: noDrillDown,
                         axmStatus: axmStatusF, productFamily: familyF, purchaseSource: purchaseF,
                         addedToOrgYear: yearF, jamfManaged: managedF, osVersion: osVerF,
-                        fileVault: fvF, checkin: checkinF, expiringWindow: expiringF) { return false }
-                    return true
+                        fileVault: fvF, checkin: checkinF, expiringWindow: expiringF)
                 }
             }
             // DeviceListPanel keys its List on filterGeneration, forcing a full remount
@@ -1235,8 +1228,6 @@ final class AppStore: ObservableObject {
     func buildCSVData(allDevices: Bool) -> Data {
         buildCSVData(from: allDevices ? devices : filteredDevices)
     }
-
-    func loadSampleData() { Task { await upsertDevices(Device.sampleDevices) } }
 }
 
 // MARK: - AuthTestStatus

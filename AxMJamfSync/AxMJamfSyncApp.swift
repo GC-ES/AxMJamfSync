@@ -74,11 +74,10 @@ struct AxMJamfSyncApp: App {
     }
     .windowStyle(.titleBar)
     .windowToolbarStyle(.unified(showsTitle: true))
-    .onChange(of: envStore.activeSyncEngine.isRunning) { _, _ in }
     .commands {
       CommandGroup(replacing: .newItem) {}
       CommandGroup(replacing: .appInfo) {
-        Button("About AxMJamfSync") {
+        Button("About AxM Jamf Sync") {
           let credits = NSMutableAttributedString(
             string: "Developed by ",
             attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)]
@@ -91,7 +90,7 @@ struct AxMJamfSyncApp: App {
             ]
           ))
           NSApplication.shared.orderFrontStandardAboutPanel(options: [
-            .applicationName: "AxMJamfSync",
+            .applicationName: "AxM Jamf Sync",
             .credits:         credits
           ])
         }
@@ -106,6 +105,10 @@ struct AxMJamfSyncApp: App {
         Button("Show Sync Log in Finder") { NSWorkspace.shared.open(logDirURL) }
           .keyboardShortcut("l", modifiers: [.command, .shift])
         Button("Open Sync Log in Console") { NSWorkspace.shared.open(logFileURL) }
+        Divider()
+        Button("Export Diagnostics…") {
+          DiagnosticsExporter.exportWithSavePanel(envStore: envStore, scheduler: scheduler, runMode: runMode)
+        }
       }
     }
 

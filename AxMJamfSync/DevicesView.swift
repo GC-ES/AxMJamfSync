@@ -3,19 +3,48 @@
 //
 // Filter row: horizontally scrollable (ScrollView) to prevent squeeze at narrow widths.
 // Filters: Type / Source / Coverage / Jamf Update — each a Menu dropdown.
-// Table: lazy-loaded, sortable, selection-aware. Export available via toolbar button.
-// Search: debounced 200ms via AppStore.scheduleFilter().
+// List: lazy-loaded, multi-selectable (Set<String> of serials). Selecting one
+//   device shows its full detail; selecting several shows a summary panel with
+//   Copy Serial Numbers / Export Selection.
+// Search: debounced 200ms via AppStore.scheduleFilter() — matches serial, Jamf
+//   name, model, username, Jamf ID, AppleCare agreement #, MDM server, order
+//   number, model identifier (see AppStore.matchesDeviceFilters).
+// Each row and the detail panel offer Copy Serial / Copy Jamf ID / Open in
+//   Jamf Pro (computers.html / mobileDevices.html, disabled with no Jamf ID
+//   or no Jamf URL configured).
 
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+/// 5.4: Jamf Pro console deep link for a device's inventory record, or nil if
+/// there's nothing to link to (no Jamf ID, or Jamf isn't configured). Shared by
+/// the row context menu and the detail panel's button row.
+private func jamfConsoleURL(for device: Device, jamfBaseURL: String) -> URL? {
+    guard let jamfId = device.jamfId, !jamfId.isEmpty, !jamfBaseURL.isEmpty else { return nil }
+    let base = jamfBaseURL.hasSuffix("/") ? String(jamfBaseURL.dropLast()) : jamfBaseURL
+    let path = device.isMobile ? "mobileDevices.html" : "computers.html"
+    return URL(string: "\(base)/\(path)?id=\(jamfId)&o=r")
+}
+
+private func copyToPasteboard(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+}
 
 struct DevicesView: View {
     @EnvironmentObject private var store: AppStore
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
-    @State private var selectedDevice: Device?
-    @State private var sortOrder: [KeyPathComparator<Device>] = [
-        .init(\.serialNumber, order: .forward)
-    ]
+    // 5.3: selection is a Set of serials (the List's own identity key) rather
+    // than a single Device — lets the user multi-select for bulk copy/export
+    // while a single selection still drives the full detail panel unchanged.
+    @State private var selectedSerials: Set<String> = []
+
+    private var selectedDevices: [Device] {
+        guard !selectedSerials.isEmpty else { return [] }
+        return store.filteredDevices.filter { selectedSerials.contains($0.serialNumber) }
+    }
 
     var body: some View {
         HSplitView {
@@ -23,29 +52,32 @@ struct DevicesView: View {
             VStack(spacing: 0) {
                 DeviceFilterBar()
                 Divider()
-                DeviceListPanel(selectedDevice: $selectedDevice)
+                DeviceListPanel(selectedSerials: $selectedSerials)
             }
             .frame(minWidth: 460, idealWidth: 560)
 
             // MARK: Right: Detail
-            if let device = selectedDevice {
-                DeviceDetailPanel(device: device)
-                    .frame(minWidth: 360, idealWidth: 420)
-            } else {
-                DeviceDetailPlaceholder()
-                    .frame(minWidth: 360, idealWidth: 420)
+            Group {
+                if selectedDevices.count == 1, let device = selectedDevices.first {
+                    DeviceDetailPanel(device: device)
+                } else if selectedDevices.count > 1 {
+                    MultiDeviceSelectionPanel(devices: selectedDevices)
+                } else {
+                    DeviceDetailPlaceholder()
+                }
             }
+            .frame(minWidth: 360, idealWidth: 420)
         }
         .background(.background)
-        // Issue 7: clear selected device when cache is wiped so stale detail doesn't persist
+        // Issue 7: clear selection when cache is wiped so stale detail doesn't persist
         .onChange(of: store.hasData) { _, hasData in
-            if !hasData { selectedDevice = nil }
+            if !hasData { selectedSerials.removeAll() }
         }
-        // Also clear selection if selected device is no longer in filtered list (e.g. filter changed)
+        // Drop any selected serial no longer in the filtered list (e.g. filter changed)
         .onChange(of: store.filteredDevices) { _, newList in
-            if let sel = selectedDevice, !newList.contains(sel) {
-                selectedDevice = nil
-            }
+            guard !selectedSerials.isEmpty else { return }
+            let stillPresent = Set(newList.map(\.serialNumber))
+            selectedSerials.formIntersection(stillPresent)
         }
     }
 }
@@ -85,7 +117,7 @@ struct DeviceFilterBar: View {
                 HStack {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                    TextField("Search serial, name, model…", text: $store.deviceSearchText)
+                    TextField("Search serial, name, model, user, Jamf ID…", text: $store.deviceSearchText)
                         .textFieldStyle(.plain)
                     if !store.deviceSearchText.isEmpty {
                         Button { store.deviceSearchText = "" } label: {
@@ -101,7 +133,7 @@ struct DeviceFilterBar: View {
                 .background(.background.secondary)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                Text("\(store.filteredDevices.count) device\(store.filteredDevices.count == 1 ? "" : "s")")
+                Text("^[\(store.filteredDevices.count) device](inflect: true)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -333,7 +365,7 @@ extension View {
 // MARK: - Device List Panel
 struct DeviceListPanel: View {
     @EnvironmentObject private var store: AppStore
-    @Binding var selectedDevice: Device?
+    @Binding var selectedSerials: Set<String>
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
 
@@ -371,10 +403,20 @@ struct DeviceListPanel: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else {
-            List(store.filteredDevices, id: \.serialNumber, selection: $selectedDevice) { device in
+            List(store.filteredDevices, id: \.serialNumber, selection: $selectedSerials) { device in
                 DeviceRow(device: device)
                     .equatable()
-                    .tag(device)
+                    .tag(device.serialNumber)
+                    .contextMenu {
+                        Button("Copy Serial Number") { copyToPasteboard(device.serialNumber) }
+                        if let jamfId = device.jamfId, !jamfId.isEmpty {
+                            Button("Copy Jamf ID") { copyToPasteboard(jamfId) }
+                        }
+                        if let url = jamfConsoleURL(for: device, jamfBaseURL: store.jamfCredentials.url) {
+                            Divider()
+                            Button("Open in Jamf Pro") { NSWorkspace.shared.open(url) }
+                        }
+                    }
             }
             .listStyle(.inset)
             // Force a full remount on every completed filter/search change rather than
@@ -413,6 +455,15 @@ struct DeviceRow: View, Equatable {
         return "Apple Device"
     }
 
+    // 5.2: MDM server/Unassigned moves to a subtitle line under the model —
+    // it's identity information about the device, not a status worth a badge,
+    // and four stacked capsules was pushing rows past 70pt tall.
+    private var mdmSubtitle: String? {
+        if let mdm = device.assignedMdmServerName, !mdm.isEmpty { return mdm }
+        if device.axmAssignmentStatus == "Unassigned" { return "MDM: Unassigned" }
+        return nil
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: device.modelIcon)
@@ -420,25 +471,25 @@ struct DeviceRow: View, Equatable {
                 .foregroundStyle(device.deviceSource.color)
                 .frame(width: 32)
 
-            // Serial + model
+            // Serial + model (+ MDM subtitle when present)
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.serialNumber)
                     .font(.callout).fontWeight(.semibold).fontDesign(.monospaced)
                 Text(modelLabel)
                     .font(.callout).foregroundStyle(.secondary)
+                if let mdmSubtitle {
+                    Label(mdmSubtitle, systemImage: "server.rack")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .labelStyle(.titleAndIcon)
+                }
             }
 
             Spacer()
 
-            // Badges
+            // Badges — coverage + source always; write-back failure only when true.
             VStack(alignment: .trailing, spacing: 4) {
                 CoverageBadge(status: device.coverageStatus)
                 SourceBadge(source: device.deviceSource, scopeAbbrev: scopeAbbrev)
-                if let mdm = device.assignedMdmServerName, !mdm.isEmpty {
-                    MdmServerBadge(serverName: mdm)
-                } else if device.axmAssignmentStatus == "Unassigned" {
-                    MdmUnassignedBadge()
-                }
                 if let wb = device.wbStatus, wb == .failed {
                     StatusBadge(label: "WB Failed", color: .red)
                 }
@@ -502,43 +553,6 @@ struct SourceBadge: View {
     }
 }
 
-struct MdmServerBadge: View {
-    let serverName: String
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "server.rack")
-                .font(.caption2)
-            Text(serverName)
-                .font(.caption2)
-                .fontWeight(.medium)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background(Color.purple.opacity(0.10))
-        .foregroundStyle(Color.purple)
-        .clipShape(Capsule())
-    }
-}
-
-struct MdmUnassignedBadge: View {
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "questionmark.circle")
-                .font(.caption2)
-            Text("Unassigned")
-                .font(.caption2)
-                .fontWeight(.medium)
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background(Color.gray.opacity(0.10))
-        .foregroundStyle(Color.secondary)
-        .clipShape(Capsule())
-    }
-}
-
 // MARK: - Device Detail Panel
 // File-scope so CoveragePlanCard (defined outside DeviceDetailPanel) can reference it
 struct CoveragePlan {
@@ -571,7 +585,7 @@ struct DeviceDetailPanel: View {
             else if let i = val as? Int      { result[key] = String(i) }
             else if let d = val as? Double   { result[key] = String(d) }
             else if let b = val as? Bool     { result[key] = b ? "true" : "false" }
-            // nil / NSNull — omit so DetailRow hides the field
+            // nil / NSNull — omit so the row is hidden entirely
         }
         return result
     }
@@ -653,7 +667,31 @@ struct DeviceDetailPanel: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 20)
-                .padding(.bottom, 16)
+                .padding(.bottom, 12)
+
+                // 5.4: quick actions — Copy Serial always available; Copy Jamf ID
+                // and Open in Jamf Pro only when there's something to act on.
+                HStack(spacing: 8) {
+                    Button { copyToPasteboard(device.serialNumber) } label: {
+                        Label("Copy Serial", systemImage: "doc.on.doc")
+                    }
+                    if let jamfId = device.jamfId, !jamfId.isEmpty {
+                        Button { copyToPasteboard(jamfId) } label: {
+                            Label("Copy Jamf ID", systemImage: "number")
+                        }
+                    }
+                    if let url = jamfConsoleURL(for: device, jamfBaseURL: store.jamfCredentials.url) {
+                        Button { NSWorkspace.shared.open(url) } label: {
+                            Label("Open in Jamf Pro", systemImage: "arrow.up.forward.square")
+                        }
+                    }
+                    Spacer()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .font(.caption)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
 
                 Divider()
 
@@ -886,11 +924,6 @@ struct DeviceDetailPanel: View {
         }
     }
 
-    private func coverageRows() -> [(String, String)] {
-        // Not used — coverage rendered as individual plan cards via coveragePlans()
-        return []
-    }
-
     // Parse all coverage plan records from raw JSON — one entry per plan
     private var coveragePlans: [CoveragePlan] {
         guard let data = device.axmCoverageRawJson,
@@ -950,12 +983,30 @@ struct DeviceDetailPanel: View {
 struct CoveragePlanCard: View {
     let plan: CoveragePlan
 
+    // 4.10: a plan whose own status is ACTIVE (and not cancelled) still has time
+    // left — its end date is a future "Expires", not a past "Expired on". A
+    // device can hold several historical plans, so this is read per-card, not
+    // from the device's overall coverageStatus.
+    private var isActive: Bool {
+        plan.status?.uppercased() == "ACTIVE" && !plan.isCanceled
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             // Plan title — "Limited Warranty" or "AppleCare Protection Plan (325381091634)"
-            Text(plan.description)
-                .font(.callout)
-                .foregroundStyle(.primary)
+            HStack(spacing: 6) {
+                Text(plan.description)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                if plan.isBest {
+                    Text("Current")
+                        .font(.caption2).fontWeight(.semibold)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.15))
+                        .foregroundStyle(Color.accentColor)
+                        .clipShape(Capsule())
+                }
+            }
 
             // Start / Expiry row — two columns matching screenshot
             HStack(spacing: 0) {
@@ -968,7 +1019,7 @@ struct CoveragePlanCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Expired on")
+                    Text(isActive ? "Expires" : "Expired on")
                         .font(.caption).foregroundStyle(.secondary)
                     Text(plan.endDate ?? "—")
                         .font(.callout).foregroundStyle(.primary)
@@ -1084,27 +1135,6 @@ struct DetailSection<Content: View>: View {
     }
 }
 
-struct DetailRow: View {
-    let label: String
-    let value: String?
-
-    var body: some View {
-        if let val = value, !val.isEmpty {
-            HStack(alignment: .top) {
-                Text(label)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 120, alignment: .leading)
-                Text(val)
-                    .font(.callout)
-                    .textSelection(.enabled)
-                    .foregroundStyle(.primary)
-                Spacer()
-            }
-        }
-    }
-}
-
 // Two-column row for compact Jamf/update sections
 struct DetailGridRow: View {
     let left:  (String, String?)
@@ -1164,7 +1194,7 @@ nonisolated(unsafe) private let _isoPlainParser: ISO8601DateFormatter = {
 }()
 
 /// Convert an ISO-8601 string (from CoreData/Apple APIs) to a readable local format.
-/// Returns nil if the string is not parseable, so DetailRow hides the field cleanly.
+/// Returns nil if the string is not parseable, so the caller hides the field cleanly.
 private func formatISO(_ iso: String) -> String? {
     if let date = _isoFracParser.date(from: iso) {
         return _detailDateFmt.string(from: date)
@@ -1195,6 +1225,66 @@ private let _shortDateFmt: DateFormatter = {
 private let _ymDateParser: DateFormatter = {
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f
 }()
+
+// MARK: - Multi-device selection panel (5.3)
+// Shown in the detail pane when 2+ rows are selected — a bulk-action summary
+// rather than trying to show N devices' worth of detail at once.
+struct MultiDeviceSelectionPanel: View {
+    @EnvironmentObject private var store: AppStore
+    let devices: [Device]
+
+    @State private var csvDocument:   CSVDocument? = nil
+    @State private var showFilePicker = false
+    @State private var didCopy        = false
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 36))
+                .foregroundStyle(Color.accentColor)
+            Text("^[\(devices.count) device](inflect: true) selected")
+                .font(.headline)
+            Text("Choose an action for the selected devices.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            VStack(spacing: 8) {
+                Button {
+                    let serials = devices.map(\.serialNumber).joined(separator: "\n")
+                    copyToPasteboard(serials)
+                    didCopy = true
+                } label: {
+                    Label(didCopy ? "Copied" : "Copy Serial Numbers",
+                          systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .onChange(of: devices) { _, _ in didCopy = false }
+
+                Button {
+                    let data = store.buildCSVData(from: devices)
+                    csvDocument = CSVDocument(csvData: data)
+                    showFilePicker = true
+                } label: {
+                    Label("Export Selection…", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .frame(maxWidth: 240)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.background.secondary)
+        .fileExporter(
+            isPresented: $showFilePicker,
+            document: csvDocument ?? CSVDocument(csvData: Data()),
+            contentType: .commaSeparatedText,
+            defaultFilename: "device_selection_\(devices.count)"
+        ) { _ in
+            csvDocument = nil
+        }
+    }
+}
 
 // MARK: - Placeholder
 struct DeviceDetailPlaceholder: View {

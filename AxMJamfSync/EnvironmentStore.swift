@@ -319,6 +319,10 @@ final class EnvironmentStore: ObservableObject {
       let engine = SyncEngine()
       engine.log           = logService
       engine.environmentId = env.id
+      // Restore this environment's own Last Run Summary now that both
+      // environmentId and its namespaced `prefs` exist — see SyncEngine's
+      // restoreLastRun(from:) doc comment for why this can't happen in init().
+      engine.restoreLastRun(from: prefs)
       let envId = env.id
       engine.onSyncStatusChange = { [weak self, weak engine] status, date in
         guard let self, let engine else { return }

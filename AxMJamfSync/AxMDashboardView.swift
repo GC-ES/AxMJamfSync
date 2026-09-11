@@ -265,7 +265,7 @@ private struct AxMDashboardFacetBar: View {
           if let ps = store.axmDashboardPurchaseSourceFacet {
             FacetActiveChip(label: ps) { store.axmDashboardPurchaseSourceFacet = nil }
           }
-          Text("\(matchCount) device\(matchCount == 1 ? "" : "s") match")
+          Text("^[\(matchCount) device](inflect: true) match")
             .font(.caption)
             .foregroundStyle(.secondary)
           Button("Clear All") { store.clearAxmDashboardFacets() }

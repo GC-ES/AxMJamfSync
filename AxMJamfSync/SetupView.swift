@@ -3,7 +3,7 @@
 //
 // Scope picker: ABM / ASM toggle. Locked (disabled) when AxM-sourced data exists in CoreData
 //   (axmDeviceId != nil). Switching loads the matching Keychain credentials.
-// Jamf page size: slider 100…2000 step 100, default 1000. Saved to Keychain.
+// Jamf page size: segmented picker 500/1000/1500/2000, default 1000. Saved to Keychain.
 // Auth test buttons: validate credentials before sync. Status shown inline.
 // Private key: loaded from .p8/.pem file via file picker. Content stored in Keychain, never path.
 
@@ -86,10 +86,35 @@ struct AxMCredentialsPanel: View {
     @EnvironmentObject private var prefs:    AppPreferences
     @EnvironmentObject private var envStore: EnvironmentStore
     let isRunning: Bool
-    @State private var saveToKeychain = true
+    // 3.1: credentials auto-save — no "Save to Keychain" toggle. isSavedToKeychain
+    // is a status flag (set from a real Keychain read on appear, and whenever this
+    // view itself writes), not a user-facing switch. verifiedAt is session-local —
+    // there's no persisted "last verified" timestamp, so a relaunch just shows
+    // "Not verified" again until Test Auth runs.
+    @State private var isSavedToKeychain = false
+    @State private var verifiedAt: Date? = nil
+    @State private var autoSaveTask: Task<Void, Never>? = nil
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
     private var scopeFull:   String { store.axmCredentials.scope.label }
+    private var maskedKeyId: String {
+        let k = store.axmCredentials.keyId
+        guard k.count > 12 else { return k }
+        return "\(k.prefix(8))…\(k.suffix(4))"
+    }
+
+    /// Debounced so a burst of keystrokes doesn't write to Keychain on every
+    /// character — commits ~0.6s after the user stops typing.
+    private func scheduleAutoSave() {
+        autoSaveTask?.cancel()
+        autoSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            guard !store.axmCredentials.clientId.isEmpty || !store.axmCredentials.keyId.isEmpty else { return }
+            store.saveAxMCredentials()
+            isSavedToKeychain = true
+        }
+    }
 
     // Locked when credentials are configured OR cache exists.
     // Derived purely from @Published AppStore properties — no Keychain reads in body.
@@ -134,7 +159,8 @@ struct AxMCredentialsPanel: View {
                             if let envId = store.environmentId {
                                 envStore.updateScope(envId, scope: scope)
                             }
-                            saveToKeychain = !saved.clientId.isEmpty
+                            isSavedToKeychain = !saved.clientId.isEmpty
+                            verifiedAt = nil
                         } label: {
                             Label(
                                 scope.label,
@@ -180,6 +206,7 @@ struct AxMCredentialsPanel: View {
                 placeholder: store.axmCredentials.scope == .school
                     ? "SCHOOLAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
                     : "BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+                .onChange(of: store.axmCredentials.clientId) { _, _ in scheduleAutoSave() }
 
             InlineCredentialField(
                 label: "Key ID",
@@ -196,6 +223,7 @@ struct AxMCredentialsPanel: View {
                 text: $store.axmCredentials.keyId,
                 isSecure: true,
                 placeholder: "AUTHKEY_XXXXXXXXXX")
+                .onChange(of: store.axmCredentials.keyId) { _, _ in scheduleAutoSave() }
 
             HStack(spacing: 8) {
                 InfoLabel(
@@ -213,16 +241,19 @@ struct AxMCredentialsPanel: View {
                     .frame(width: 140, alignment: .leading)
                 // Status pill — shows where the key was loaded from
                 if !store.axmCredentials.privateKeyContent.isEmpty {
+                    // 3.1: masked Key ID alongside the source pill, so it's clear
+                    // *which* key is loaded, not just that one is.
+                    let suffix = maskedKeyId.isEmpty ? "" : " · \(maskedKeyId)"
                     if store.axmCredentials.privateKeyPath.isEmpty {
                         // Content came from Keychain (path not set = loaded on app launch from Keychain)
-                        Label("Loaded from Keychain", systemImage: "lock.shield.fill")
+                        Label("Loaded from Keychain\(suffix)", systemImage: "lock.shield.fill")
                             .font(.caption).foregroundStyle(.green)
                             .padding(.horizontal, 8).padding(.vertical, 3)
                             .background(Color.green.opacity(0.12))
                             .clipShape(Capsule())
                     } else {
                         // Content just loaded from a file the user just picked this session
-                        Label("Loaded from file", systemImage: "arrow.down.doc.fill")
+                        Label("Loaded from file\(suffix)", systemImage: "arrow.down.doc.fill")
                             .font(.caption).foregroundStyle(.blue)
                             .padding(.horizontal, 8).padding(.vertical, 3)
                             .background(Color.blue.opacity(0.12))
@@ -239,20 +270,19 @@ struct AxMCredentialsPanel: View {
             Divider()
 
             HStack(spacing: 8) {
-                Toggle("Save to Keychain", isOn: $saveToKeychain)
-                    .toggleStyle(.checkbox).font(.callout)
-                    .onChange(of: saveToKeychain) { _, on in
-                        if on { store.saveAxMCredentials() }
-                    }
-                if saveToKeychain {
-                    Button { clearCreds() } label: { Text("Clear").foregroundStyle(.red) }
-                        .buttonStyle(.plain)
-                        .help("Remove all Apple Business/School Manager credentials saved on this Mac and blank out all the fields above. You will need to re-enter them before you can run a sync.")
-                }
+                CredentialStatusLine(isSaved: isSavedToKeychain, verifiedAt: verifiedAt)
+                Button { clearCreds() } label: { Text("Clear").foregroundStyle(.red) }
+                    .buttonStyle(.plain)
+                    .help("Remove all Apple Business/School Manager credentials saved on this Mac and blank out all the fields above. You will need to re-enter them before you can run a sync.")
                 Spacer()
                 Button {
-                    if saveToKeychain { store.saveAxMCredentials() }
-                    Task { await store.testAxMAuth() }
+                    autoSaveTask?.cancel()
+                    store.saveAxMCredentials()
+                    isSavedToKeychain = true
+                    Task {
+                        await store.testAxMAuth()
+                        if case .success = store.axmAuthStatus { verifiedAt = Date() }
+                    }
                 } label: {
                     Label("Test Auth", systemImage: "network.badge.shield.half.filled")
                 }
@@ -264,11 +294,11 @@ struct AxMCredentialsPanel: View {
         }
         .onAppear {
             // Check Keychain directly — store.axmCredentials may be populated in-memory
-            // without ever having been saved, which would wrongly enable the toggle.
+            // without ever having been saved, which would wrongly show "Saved".
             let inKeychain = store.environmentId.map {
                 KeychainService.loadAxMCredentialsForEnv(id: $0, scope: store.axmCredentials.scope)
             } ?? KeychainService.loadAxMCredentials(for: store.axmCredentials.scope)
-            saveToKeychain = !inKeychain.clientId.isEmpty
+            isSavedToKeychain = !inKeychain.clientId.isEmpty
         }
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
@@ -289,7 +319,9 @@ struct AxMCredentialsPanel: View {
             if let content = try? String(contentsOf: url, encoding: .utf8) {
                 store.axmCredentials.privateKeyContent = content
             }
-            if saveToKeychain { store.saveAxMCredentials() }  // only save if user opted in
+            // 3.1: always save — picking a file is itself an explicit save intent.
+            store.saveAxMCredentials()
+            isSavedToKeychain = true
         }
     }
 
@@ -306,8 +338,9 @@ struct AxMCredentialsPanel: View {
         KeychainService.delete(for: .axmBizPrivateKey)
         KeychainService.delete(for: .axmSchoolClientId); KeychainService.delete(for: .axmSchoolKeyId)
         KeychainService.delete(for: .axmSchoolPrivateKey); KeychainService.delete(for: .axmScope)
-        store.axmAuthStatus = .idle
-        saveToKeychain = false
+        store.axmAuthStatus  = .idle
+        isSavedToKeychain     = false
+        verifiedAt            = nil
     }
 }
 
@@ -316,9 +349,23 @@ struct AxMCredentialsPanel: View {
 struct JamfCredentialsPanel: View {
     @EnvironmentObject private var store: AppStore
     let isRunning: Bool
-    @State private var showSecret     = false
-    @State private var saveToKeychain = true
-    @State private var pageSize: Double = 1000   // local mirror of store.jamfCredentials.pageSize
+    @State private var showSecret        = false
+    @State private var isSavedToKeychain = false
+    @State private var verifiedAt: Date? = nil
+    @State private var autoSaveTask: Task<Void, Never>? = nil
+    @State private var pageSize: Int = 1000       // local mirror of store.jamfCredentials.pageSize
+
+    /// 3.1: debounced auto-save — see AxMCredentialsPanel.scheduleAutoSave.
+    private func scheduleAutoSave() {
+        autoSaveTask?.cancel()
+        autoSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            guard !store.jamfCredentials.url.isEmpty || !store.jamfCredentials.clientId.isEmpty else { return }
+            store.saveJamfCredentials()
+            isSavedToKeychain = true
+        }
+    }
 
     var body: some View {
         CardSection(title: "Jamf Pro", icon: "server.rack") {
@@ -338,6 +385,7 @@ struct JamfCredentialsPanel: View {
                 text: $store.jamfCredentials.url,
                 isSecure: false,
                 placeholder: "https://yourinstance.jamfcloud.com")
+                .onChange(of: store.jamfCredentials.url) { _, _ in scheduleAutoSave() }
 
             InlineCredentialField(
                 label: "Client ID",
@@ -354,6 +402,7 @@ struct JamfCredentialsPanel: View {
                 text: $store.jamfCredentials.clientId,
                 isSecure: false,
                 placeholder: "a1b2c3d4-e5f6-…")
+                .onChange(of: store.jamfCredentials.clientId) { _, _ in scheduleAutoSave() }
 
             HStack(spacing: 8) {
                 InfoLabel(
@@ -372,9 +421,11 @@ struct JamfCredentialsPanel: View {
                 if showSecret {
                     TextField("Client Secret", text: $store.jamfCredentials.clientSecret)
                         .textFieldStyle(.roundedBorder)
+                        .onChange(of: store.jamfCredentials.clientSecret) { _, _ in scheduleAutoSave() }
                 } else {
                     SecureField("Client Secret", text: $store.jamfCredentials.clientSecret)
                         .textFieldStyle(.roundedBorder)
+                        .onChange(of: store.jamfCredentials.clientSecret) { _, _ in scheduleAutoSave() }
                 }
                 Button { showSecret.toggle() } label: {
                     Image(systemName: showSecret ? "eye.slash" : "eye").foregroundStyle(.secondary)
@@ -389,18 +440,23 @@ struct JamfCredentialsPanel: View {
                         title:   "Jamf Page Size",
                         summary: "Controls how many computer records are downloaded from Jamf Pro in each network request.",
                         bullets: [
-                            "Smaller values (50–100) are safer for slow or heavily loaded Jamf servers.",
+                            "Smaller values are safer for slow or heavily loaded Jamf servers.",
                             "Larger values are faster but can cause timeouts on older Jamf instances.",
-                            "1000 is the default. Options: 500 / 1000 / 1500 / 2000. Lower if you see request timeouts."
+                            "1000 is the default. Lower to 500 if you see request timeouts."
                         ]
                     ))
-                HStack {
-                    Slider(value: $pageSize, in: 500...2000, step: 500)
-                        .onChange(of: pageSize) { _, val in
-                            store.jamfCredentials.pageSize = Int(val)
-                        }
-                    Text("\(Int(pageSize))")
-                        .monospacedDigit().frame(width: 48, alignment: .trailing)
+                // 4.14: four discrete values, not a continuous range — a segmented
+                // Picker states that plainly instead of a slider whose snap-to-step
+                // behaviour isn't otherwise visible.
+                Picker("", selection: $pageSize) {
+                    ForEach([500, 1000, 1500, 2000], id: \.self) { size in
+                        Text("\(size)").tag(size)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: pageSize) { _, val in
+                    store.jamfCredentials.pageSize = val
                 }
             }
 
@@ -409,20 +465,19 @@ struct JamfCredentialsPanel: View {
             Divider()
 
             HStack(spacing: 8) {
-                Toggle("Save to Keychain", isOn: $saveToKeychain)
-                    .toggleStyle(.checkbox).font(.callout)
-                    .onChange(of: saveToKeychain) { _, on in
-                        if on { store.saveJamfCredentials() }
-                    }
-                if saveToKeychain {
-                    Button { clearCreds() } label: { Text("Clear").foregroundStyle(.red) }
-                        .buttonStyle(.plain)
-                        .help("Remove all Jamf Pro credentials saved on this Mac and blank out all the fields above. You will need to re-enter them before the app can connect to Jamf.")
-                }
+                CredentialStatusLine(isSaved: isSavedToKeychain, verifiedAt: verifiedAt)
+                Button { clearCreds() } label: { Text("Clear").foregroundStyle(.red) }
+                    .buttonStyle(.plain)
+                    .help("Remove all Jamf Pro credentials saved on this Mac and blank out all the fields above. You will need to re-enter them before the app can connect to Jamf.")
                 Spacer()
                 Button {
-                    if saveToKeychain { store.saveJamfCredentials() }
-                    Task { await store.testJamfAuth() }
+                    autoSaveTask?.cancel()
+                    store.saveJamfCredentials()
+                    isSavedToKeychain = true
+                    Task {
+                        await store.testJamfAuth()
+                        if case .success = store.jamfAuthStatus { verifiedAt = Date() }
+                    }
                 } label: {
                     Label("Test Auth", systemImage: "network.badge.shield.half.filled")
                 }
@@ -434,13 +489,17 @@ struct JamfCredentialsPanel: View {
         }
         .onAppear {
             // Check Keychain directly — store.jamfCredentials may be populated in-memory
-            // without ever having been saved, which would wrongly enable the toggle.
+            // without ever having been saved, which would wrongly show "Saved".
             let inKeychain = store.environmentId.map {
                 KeychainService.loadJamfCredentialsForEnv(id: $0)
             } ?? KeychainService.loadJamfCredentials()
-            saveToKeychain = !inKeychain.clientId.isEmpty
+            isSavedToKeychain = !inKeychain.clientId.isEmpty
             // Sync local pageSize mirror from store (avoids Binding get/set cycle on macOS 26)
-            pageSize = Double(store.jamfCredentials.pageSize)
+            // Snap to the nearest offered value in case a pre-4.14 install had a
+            // page size the segmented Picker no longer offers verbatim.
+            pageSize = [500, 1000, 1500, 2000].min {
+                abs($0 - store.jamfCredentials.pageSize) < abs($1 - store.jamfCredentials.pageSize)
+            } ?? 1000
         }
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
@@ -458,8 +517,39 @@ struct JamfCredentialsPanel: View {
         // Also delete v1 flat keys
         KeychainService.delete(for: .jamfURL); KeychainService.delete(for: .jamfClientId)
         KeychainService.delete(for: .jamfClientSecret); KeychainService.delete(for: .jamfPageSize)
-        store.jamfAuthStatus = .idle
-        saveToKeychain = false
+        store.jamfAuthStatus  = .idle
+        isSavedToKeychain      = false
+        verifiedAt             = nil
+    }
+}
+
+// MARK: - Credential status line (3.1)
+// Replaces the old "Save to Keychain" toggle — credentials auto-save, and this
+// line reports what actually happened instead of asking the user to opt in.
+struct CredentialStatusLine: View {
+    let isSaved:   Bool
+    let verifiedAt: Date?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if isSaved {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("Saved to Keychain")
+                if let verifiedAt {
+                    Text("· Verified")
+                    Text(verifiedAt, style: .relative)
+                } else {
+                    Text("· Not verified")
+                }
+            } else {
+                Image(systemName: "circle")
+                    .foregroundStyle(.secondary)
+                Text("Not saved yet")
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
     }
 }
 
@@ -897,22 +987,6 @@ struct TogglePrefOneShot: View {
     }
 }
 
-struct CredentialField: View {
-    let label: String; let info: InfoContent
-    @Binding var text: String
-    let isSecure: Bool; var placeholder: String = ""
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            InfoLabel(text: label, info: info)
-            if isSecure {
-                SecureField(placeholder, text: $text).textFieldStyle(.roundedBorder)
-            } else {
-                TextField(placeholder, text: $text).textFieldStyle(.roundedBorder)
-            }
-        }
-    }
-}
-
 struct InlineCredentialField: View {
     let label: String; let info: InfoContent
     @Binding var text: String
@@ -930,17 +1004,3 @@ struct InlineCredentialField: View {
     }
 }
 
-private struct SyncTimestamp: View {
-    let label: String; let date: Date?
-    private static let df: DateFormatter = {
-        let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short; return f
-    }()
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            Text(date.map { Self.df.string(from: $0) } ?? "Never")
-                .font(.caption).fontWeight(.medium)
-                .foregroundStyle(date == nil ? .secondary : .primary)
-        }
-    }
-}

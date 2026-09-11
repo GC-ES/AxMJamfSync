@@ -1,6 +1,12 @@
 // EnvironmentSidebarView.swift
 // Left sidebar for v2.0 multi-environment navigation.
 // Lists environments with status indicators; allows add, rename, delete.
+//
+// 7.1: environments live in a native List(selection:) — keyboard ↑↓, VoiceOver,
+// and the sidebar's vibrancy/selection styling all come from that for free,
+// replacing the old manually-highlighted ScrollView+LazyVStack+onTapGesture rows.
+// 7.4: rename is inline (double-click the name, or press Return on the selected
+// row; Esc cancels) — the popover-based RenameEnvironmentView is gone.
 
 import SwiftUI
 import AppKit
@@ -13,9 +19,43 @@ struct EnvironmentSidebarView: View {
   @State private var showAddSheet      = false
   @State private var renamingId:       UUID?   = nil
   @State private var renameText:       String  = ""
+  @FocusState private var renameFieldFocused: Bool
   @State private var deletingId:       UUID?   = nil
   @State private var showMultiSync     = false
   @State private var deleteError:      String? = nil
+
+  /// 7.2: a scope tag on every row is redundant noise when every environment
+  /// shares one scope (the common case) — only worth showing when they differ.
+  private var scopesAreMixed: Bool {
+    Set(envStore.environments.map(\.scope)).count > 1
+  }
+
+  /// Write-deferred so List's own internal selection write (during its update
+  /// pass) never lands a direct @Published mutation mid-update — same
+  /// AttributeGraph hazard as AppStore.facetBinding, see ARCHITECTURE.md.
+  private var selectionBinding: Binding<UUID?> {
+    Binding(
+      get: { envStore.activeEnvironmentId },
+      set: { newValue in
+        guard let id = newValue else { return }
+        DispatchQueue.main.async { envStore.setActive(id) }
+      }
+    )
+  }
+
+  private func startRename(_ env: AppEnvironment) {
+    renamingId = env.id
+    renameText = env.name
+    renameFieldFocused = true
+  }
+
+  private func commitRename() {
+    defer { renamingId = nil }
+    guard let id = renamingId else { return }
+    let trimmed = renameText.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty else { return }
+    envStore.rename(id, to: trimmed)
+  }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -71,27 +111,33 @@ struct EnvironmentSidebarView: View {
       Divider()
 
       // Environment list
-      ScrollView {
-        LazyVStack(spacing: 2) {
-          ForEach(envStore.environments) { env in
-            EnvironmentRow(
-              env:        env,
-              isActive:   env.id == envStore.activeEnvironmentId,
-              isRunning:  syncEngine.isRunning && env.id == envStore.activeEnvironmentId,
-              isQueued:   envStore.syncQueue.dropFirst().contains(env.id),
-              blockReason: envStore.deletionBlockReason(env.id),
-              onSelect:   { envStore.setActive(env.id) },
-              onRename: {
-                renamingId = env.id
-                renameText = env.name
-              },
-              onDelete:   {
-                deletingId = env.id
-              }
-            )
-          }
-        }
-        .padding(.vertical, 4)
+      List(envStore.environments, id: \.id, selection: selectionBinding) { env in
+        EnvironmentRow(
+          env:         env,
+          isActive:    env.id == envStore.activeEnvironmentId,
+          isRunning:   syncEngine.isRunning && env.id == envStore.activeEnvironmentId,
+          isQueued:    envStore.syncQueue.dropFirst().contains(env.id),
+          blockReason: envStore.deletionBlockReason(env.id),
+          showScopeTag: scopesAreMixed,
+          isRenaming:  renamingId == env.id,
+          renameText:  $renameText,
+          renameFieldFocused: $renameFieldFocused,
+          onStartRename:  { startRename(env) },
+          onCommitRename: { commitRename() },
+          onCancelRename: { renamingId = nil },
+          onDelete: { deletingId = env.id }
+        )
+        .tag(env.id)
+      }
+      .listStyle(.sidebar)
+      // 7.4: Return-to-rename — only while nothing is already being renamed and
+      // a row is actually selected. Esc-to-cancel lives on the row's TextField
+      // itself (.onExitCommand), since only it has keyboard focus by then.
+      .onKeyPress(.return) {
+        guard renamingId == nil, let id = envStore.activeEnvironmentId,
+              let env = envStore.environments.first(where: { $0.id == id }) else { return .ignored }
+        startRename(env)
+        return .handled
       }
 
       Divider()
@@ -108,18 +154,6 @@ struct EnvironmentSidebarView: View {
     // Add sheet
     .sheet(isPresented: $showAddSheet) {
       AddEnvironmentSheet()
-    }
-    // Rename popover
-    .popover(isPresented: Binding(
-      get: { renamingId != nil },
-      set: { if !$0 { renamingId = nil } }
-    )) {
-      RenameEnvironmentView(text: $renameText) {
-        if let id = renamingId, !renameText.trimmingCharacters(in: .whitespaces).isEmpty {
-          envStore.rename(id, to: renameText.trimmingCharacters(in: .whitespaces))
-        }
-        renamingId = nil
-      }
     }
     // Delete confirmation sheet
     .sheet(isPresented: Binding(
@@ -159,8 +193,17 @@ struct EnvironmentRow: View {
   let isQueued:    Bool
   /// nil when the environment can be deleted; otherwise why it can't.
   let blockReason: EnvironmentStore.DeletionBlockReason?
-  let onSelect:    () -> Void
-  let onRename:    () -> Void
+  /// 7.2: only draw the trailing ABM/ASM tag when the sidebar actually holds a
+  /// mix of scopes — redundant on every row when it's all one scope.
+  let showScopeTag: Bool
+  // 7.4: inline rename — state lives in the parent (one shared renamingId), this
+  // row just reflects whether it's the one currently being edited.
+  let isRenaming:  Bool
+  @Binding var renameText: String
+  var renameFieldFocused: FocusState<Bool>.Binding
+  let onStartRename:  () -> Void
+  let onCommitRename: () -> Void
+  let onCancelRename: () -> Void
   let onDelete:    () -> Void
 
   @State private var isHovering = false
@@ -193,22 +236,54 @@ struct EnvironmentRow: View {
           .frame(width: 12, height: 12)
       }
 
-      // Name + scope badge
+      // Name (or inline rename field) + last-synced subtitle
       VStack(alignment: .leading, spacing: 1) {
-        Text(env.name)
-          .font(.callout)
-          .fontWeight(isActive ? .semibold : .regular)
-          .foregroundStyle(isActive ? .primary : .secondary)
-          .lineLimit(1)
-        Text(env.scope == .school ? "ASM" : "ABM")
-          .font(.caption2)
-          .foregroundStyle(.tertiary)
+        if isRenaming {
+          TextField("Environment name", text: $renameText)
+            .textFieldStyle(.plain)
+            .font(.callout)
+            .focused(renameFieldFocused)
+            .onSubmit { onCommitRename() }
+            .onExitCommand { onCancelRename() }
+        } else {
+          Text(env.name)
+            .font(.callout)
+            .fontWeight(isActive ? .semibold : .regular)
+            .foregroundStyle(isActive ? .primary : .secondary)
+            .lineLimit(1)
+            .onTapGesture(count: 2) { onStartRename() }
+        }
+        // 7.2: sync recency — an MSP scanning many tenants wants "when did
+        // this last run", not a scope label duplicating the sidebar footer.
+        HStack(spacing: 3) {
+          Image(systemName: env.lastSyncStatus.icon)
+            .font(.system(size: 8))
+            .foregroundStyle(env.lastSyncStatus.color)
+          if let date = env.lastSyncedAt {
+            Text("Synced ") + Text(date, style: .relative)
+          } else {
+            Text("Never synced")
+          }
+        }
+        .font(.caption2)
+        .foregroundStyle(.tertiary)
       }
 
       Spacer()
 
-      // Delete button — visible on hover or when active
-      if (isHovering || isActive) && showDeleteControl {
+      if showScopeTag {
+        Text(env.scope == .school ? "ASM" : "ABM")
+          .font(.caption2)
+          .foregroundStyle(.tertiary)
+          .padding(.horizontal, 5).padding(.vertical, 1)
+          .background(Color.secondary.opacity(0.12))
+          .clipShape(Capsule())
+      }
+
+      // 7.3: hover-only now — the typed-name delete sheet already guards
+      // against a misclick, so a permanently-visible trash icon next to the
+      // active environment was just unnerving with no added safety.
+      if isHovering && showDeleteControl {
         Button {
           onDelete()
         } label: {
@@ -222,23 +297,17 @@ struct EnvironmentRow: View {
         .transition(.opacity)
       }
     }
-    .padding(.horizontal, 10)
-    .padding(.vertical, 6)
-    .background(
-      RoundedRectangle(cornerRadius: 6)
-        .fill(isActive ? Color.accentColor.opacity(0.1) : Color.clear)
-    )
+    .padding(.horizontal, 2)
+    .padding(.vertical, 2)
     .contentShape(Rectangle())
-    .onTapGesture { onSelect() }
     .onHover { isHovering = $0 }
     .contextMenu {
-      Button("Rename…") { onRename() }
+      Button("Rename…") { onStartRename() }
       Divider()
       Button("Delete…", role: .destructive) { onDelete() }
         .disabled(!canDelete)
       if let blockReason { Text(blockReason.userMessage) }
     }
-    .padding(.horizontal, 4)
     .animation(.easeInOut(duration: 0.15), value: isHovering)
   }
 }
@@ -288,31 +357,6 @@ struct AddEnvironmentSheet: View {
     let env = envStore.add(name: trimmed, scope: .business)
     envStore.setActive(env.id)
     dismiss()
-  }
-}
-
-// MARK: - Rename popover
-
-struct RenameEnvironmentView: View {
-  @Binding var text: String
-  let onCommit: () -> Void
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("Rename Environment")
-        .font(.headline)
-      TextField("Environment name", text: $text)
-        .textFieldStyle(.roundedBorder)
-        .frame(width: 200)
-        .onSubmit { onCommit() }
-      HStack {
-        Spacer()
-        Button("Rename") { onCommit() }
-          .buttonStyle(.borderedProminent)
-          .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
-      }
-    }
-    .padding(16)
   }
 }
 
@@ -493,7 +537,7 @@ struct MultiSyncPopover: View {
             .font(.caption)
             .foregroundStyle(.tertiary)
         } else {
-          Text("\(selected.count) environment\(selected.count == 1 ? "" : "s") selected")
+          Text("^[\(selected.count) environment](inflect: true) selected")
             .font(.caption)
             .foregroundStyle(.secondary)
         }
@@ -557,7 +601,7 @@ struct MigrationOverlayView: View {
             .fixedSize()
             .scaleEffect(1.2)
 
-          Text("Upgrading to v2.1")
+          Text("Upgrading to v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "2")")
             .font(.headline)
 
           Text(status.isEmpty ? "Migrating data…" : status)

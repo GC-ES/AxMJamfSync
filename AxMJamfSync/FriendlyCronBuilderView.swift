@@ -66,11 +66,11 @@ struct FriendlyCronBuilderView: View {
 
       switch unit {
       case .minute:
-        Stepper("Every \(everyN) minute\(everyN == 1 ? "" : "s")", value: $everyN, in: 1...59)
+        Stepper("Every ^[\(everyN) minute](inflect: true)", value: $everyN, in: 1...59)
           .onChange(of: everyN) { _, _ in commit() }
 
       case .hour:
-        Stepper("Every \(everyN) hour\(everyN == 1 ? "" : "s")", value: $everyN, in: 1...23)
+        Stepper("Every ^[\(everyN) hour](inflect: true)", value: $everyN, in: 1...23)
           .onChange(of: everyN) { _, _ in commit() }
         Stepper("At minute \(minuteOfHour)", value: $minuteOfHour, in: 0...59)
           .onChange(of: minuteOfHour) { _, _ in commit() }

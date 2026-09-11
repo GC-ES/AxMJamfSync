@@ -62,8 +62,12 @@ enum SyncNotificationService {
     }
 
     // MARK: - Failure
+    // 4.5: informational, not critical — a sync failure never risks data loss
+    // (existing cache is untouched), so an insistent bounce-until-focused
+    // request overstates the severity. The notification itself still uses
+    // .defaultCritical sound so it's not silent.
     static func sendError(message: String) {
-        NSApp.requestUserAttention(.criticalRequest)   // dock bounces until user focuses app
+        NSApp.requestUserAttention(.informationalRequest)
 
         let content = UNMutableNotificationContent()
         content.title = "AxM Sync Failed ✗"

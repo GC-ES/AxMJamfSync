@@ -1,5 +1,7 @@
 // SyncPanelView.swift
 // Sync tab UI — run controls, progress block, last run summary, log window.
+// Summary and log sit in a VSplitView so the log pane can be resized —
+// worthwhile on a long run when the log is the thing worth expanding.
 //
 // Progress block (SyncProgressBlock):
 //   - Step ETA ("~Xm Ys remaining") shown ABOVE the progress bar in orange.
@@ -7,7 +9,12 @@
 //   - Step elapsed time shown bottom-right when no ETA is available.
 //   - Elapsed wall-clock timer top-right (counts up since sync started).
 //
-// Log window (LogWindowView): throttled 8fps refresh, level filter, text search.
+// Log window (LogWindowView): throttled 8fps refresh, level filter (All /
+// Info / Warn+ / Error — Warn+ is warn-or-error), text search. Auto-scroll
+// only follows new lines while the user is at the bottom (tracked via an
+// invisible sentinel row's onAppear/onDisappear); scrolled up shows a "Jump
+// to Latest" pill instead of yanking the view back down. Clear resets only
+// the in-memory entries shown here — the on-disk file/rotation is untouched.
 
 import SwiftUI
 
@@ -29,40 +36,43 @@ struct SyncView: View {
             }
             .padding(.horizontal, 24).padding(.top, 16).padding(.bottom, 12)
 
-            // ── Scrollable content ───────────────────────────────────
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+            // 3.3: VSplitView instead of a fixed-height ScrollView above a fixed-
+            // remainder log — lets the log pane be resized when it's the thing
+            // worth expanding (a long run) without losing the summary above.
+            VSplitView {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
 
-                    if engine.isRunning {
-                        GroupBox {
-                            SyncProgressBlock(engine: engine)
-                        } label: {
-                            Label("In Progress", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.headline)
+                        if engine.isRunning {
+                            GroupBox {
+                                SyncProgressBlock(engine: engine)
+                            } label: {
+                                Label("In Progress", systemImage: "arrow.triangle.2.circlepath")
+                                    .font(.headline)
+                            }
+                            .padding(.horizontal, 24)
                         }
-                        .padding(.horizontal, 24)
-                    }
 
-                    if engine.lastRunDate != nil && !engine.isRunning {
-                        SyncOutcomeBanner(engine: engine)
-                            .padding(.horizontal, 24)
-                    }
+                        if engine.lastRunDate != nil && !engine.isRunning {
+                            SyncOutcomeBanner(engine: engine)
+                                .padding(.horizontal, 24)
+                        }
 
-                    if engine.lastRunDate != nil {
-                        RichRunSummaryCard(engine: engine)
-                            .padding(.horizontal, 24)
-                    }
+                        if engine.lastRunDate != nil {
+                            RichRunSummaryCard(engine: engine)
+                                .padding(.horizontal, 24)
+                        }
 
-                    Spacer(minLength: 0)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 4)
                 }
+                .frame(minHeight: 120, idealHeight: engine.lastRunDate != nil ? 340 : 160)
+
+                LogWindowView(log: engine.log)
+                    .frame(minHeight: 160)
+                    .padding(.horizontal, 24).padding(.vertical, 12)
             }
-            .frame(maxHeight: engine.lastRunDate != nil ? 420 : 180)
-
-            Divider()
-
-            LogWindowView(log: engine.log)
-                .frame(maxHeight: .infinity)
-                .padding(.horizontal, 24).padding(.vertical, 12)
         }
         .background(.background)
     }
@@ -115,15 +125,35 @@ struct SyncOutcomeBanner: View {
     }
 }
 
-// MARK: - Rich Run Summary Card (matches image 3)
+// MARK: - Rich Run Summary Card
 
 struct RichRunSummaryCard: View {
     @ObservedObject var engine: SyncEngine
-    @EnvironmentObject private var store: AppStore
 
     private static let dateFmt: DateFormatter = {
         let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short; return f
     }()
+
+    // 3.2: Apple devices · Jamf devices · Coverage checked · Jamf updated ·
+    // Jamf failed · Duration — replaces the old tile set, which had an "Active"
+    // tile that silently swapped between three unrelated counters and a
+    // "Released" tile that read *live* store.stats rather than this run.
+    private var appleSubtitle: String {
+        if engine.lastRunAxmCount > 0 { return "fetched" }
+        if engine.lastRunFromCache > 0 { return "^[\(engine.lastRunFromCache) from cache](inflect: true)" }
+        return "cache fresh"
+    }
+    private var jamfSubtitle: String {
+        engine.lastRunJamfCount > 0 ? "fetched" : "cache fresh"
+    }
+    private var coverageSubtitle: String {
+        guard engine.lastRunCovFetched > 0 else { return "no devices checked" }
+        return "\(engine.lastRunCovActive) active · \(engine.lastRunCovInactive) inactive"
+    }
+    private func macMobileSubtitle(mac: Int, mobile: Int) -> String {
+        guard mac + mobile > 0 else { return "" }
+        return "\(mac) Mac · \(mobile) Mobile"
+    }
 
     var body: some View {
         GroupBox {
@@ -139,60 +169,61 @@ struct RichRunSummaryCard: View {
                     }
                 }
 
-                // 3×2 tile grid — exactly matching the screenshot
                 let cols = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
                 LazyVGrid(columns: cols, spacing: 10) {
                     RunStatTile(
-                        icon: "checkmark.circle",
-                        value: "\(engine.lastRunAxmCount > 0 ? engine.lastRunAxmCount : (engine.lastRunFromCache > 0 ? engine.lastRunFromCache : engine.lastRunJamfCount))",
-                        label: "Active",
-                        color: .blue
+                        icon: "applelogo",
+                        value: "\(engine.lastRunAxmCount)",
+                        label: "Apple Devices",
+                        color: .blue,
+                        subtitle: appleSubtitle
+                    )
+                    RunStatTile(
+                        icon: "server.rack",
+                        value: "\(engine.lastRunJamfCount)",
+                        label: "Jamf Devices",
+                        color: .indigo,
+                        subtitle: jamfSubtitle
                     )
                     RunStatTile(
                         icon: "shield.lefthalf.filled",
-                        value: "\(engine.lastRunCovActive)",
-                        label: "Coverage Active",
-                        color: .green
+                        value: "\(engine.lastRunCovFetched)",
+                        label: "Coverage Checked",
+                        color: .green,
+                        subtitle: coverageSubtitle
                     )
                     RunStatTile(
-                        icon: "minus.circle",
-                        value: "\(store.stats.axmReleased)",
-                        label: "Released",
-                        color: .orange
-                    )
-                    RunStatTile(
-                        icon: "tray.2.fill",
-                        value: "\(engine.lastRunFromCache)",
-                        label: "From Cache",
-                        color: .purple
-                    )
-                    RunStatTile(
-                        icon: "shield.slash",
-                        value: "\(engine.lastRunCovNone)",
-                        label: "No Coverage Info",
-                        color: .pink
+                        icon: "checkmark.circle",
+                        value: "\(engine.lastRunWBSynced)",
+                        label: "Jamf Updated",
+                        color: .purple,
+                        subtitle: macMobileSubtitle(mac: engine.lastRunWBSyncedMac, mobile: engine.lastRunWBSyncedMob)
                     )
                     RunStatTile(
                         icon: "xmark.circle",
                         value: "\(engine.lastRunWBFailed)",
-                        label: "Failed",
+                        label: "Jamf Failed",
+                        color: engine.lastRunWBFailed > 0 ? .red : .secondary,
+                        subtitle: macMobileSubtitle(mac: engine.lastRunWBFailedMac, mobile: engine.lastRunWBFailedMob)
+                    )
+                    RunStatTile(
+                        icon: "clock",
+                        value: engine.lastRunElapsed.isEmpty ? "—" : engine.lastRunElapsed,
+                        label: "Duration",
                         color: .secondary
                     )
                 }
 
                 // Footer
-                Divider()
-                HStack {
-                    if !engine.lastRunElapsed.isEmpty {
-                        Image(systemName: "clock").font(.caption).foregroundStyle(.secondary)
-                        Text("Completed in \(engine.lastRunElapsed)")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if engine.lastRunWBFailed > 0 {
+                if engine.lastRunWBFailed > 0 || engine.lastRunMdmServers > 0 {
+                    Divider()
+                }
+                if engine.lastRunWBFailed > 0 {
+                    HStack {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.caption)
-                        Text("\(engine.lastRunWBFailed) Jamf Update failure\(engine.lastRunWBFailed == 1 ? "" : "s")")
+                        Text("^[\(engine.lastRunWBFailed) Jamf Update failure](inflect: true)")
                             .font(.caption).foregroundStyle(.orange)
+                        Spacer()
                     }
                 }
                 if engine.lastRunMdmServers > 0 {
@@ -200,7 +231,7 @@ struct RichRunSummaryCard: View {
                         Image(systemName: "server.rack")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        Text("\(engine.lastRunMdmServers) MDM server\(engine.lastRunMdmServers == 1 ? "" : "s") · \(engine.lastRunMdmAssigned) assigned")
+                        Text("^[\(engine.lastRunMdmServers) MDM server](inflect: true) · \(engine.lastRunMdmAssigned) assigned")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -217,6 +248,7 @@ private struct RunStatTile: View {
     let value: String
     let label: String
     let color: Color
+    var subtitle: String = ""
 
     var body: some View {
         VStack(alignment: .center, spacing: 6) {
@@ -228,6 +260,11 @@ private struct RunStatTile: View {
             Text(label)
                 .font(.caption).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            if !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 16).padding(.horizontal, 8)
@@ -280,6 +317,16 @@ struct SyncProgressBlock: View {
                             .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                     }
                 }
+                // 3.3: the overall-run ETA the file header already documents but
+                // never actually rendered — a long coverage run is exactly where
+                // "how much longer, total" matters most.
+                if !engine.totalETA.isEmpty {
+                    HStack {
+                        Spacer()
+                        Text(engine.totalETA)
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
             }
         }
         // Elapsed-time ticker: a MainActor-isolated task, restarted whenever the run
@@ -322,10 +369,26 @@ struct LogWindowView: View {
     @ObservedObject var log: LogService
     @State private var filterLevel: LogEntry.Level? = nil
     @State private var searchText:  String          = ""
+    // 3.4: tracks whether the bottom-anchor row is currently visible in the
+    // scroll viewport — true means the user is at (or near) the bottom, which is
+    // when new lines should auto-follow. Toggled by the anchor's onAppear/
+    // onDisappear since SwiftUI has no direct scroll-offset API before macOS 15
+    // (this app's floor is macOS 14).
+    @State private var isAtBottom = true
+    @State private var showClearConfirm = false
 
+    private static let bottomAnchorId = "log-bottom-anchor"
+
+    // filterLevel == .warn means "Warn+" — warn and error together — since a
+    // segmented control has no room for a genuine multi-select and "everything
+    // at or above Warn" is what admins actually want when triaging a run.
     var visibleEntries: [LogEntry] {
         var result = log.entries
-        if let level = filterLevel { result = result.filter { $0.level == level } }
+        if let level = filterLevel {
+            result = level == .warn
+                ? result.filter { $0.level == .warn || $0.level == .error }
+                : result.filter { $0.level == level }
+        }
         if !searchText.isEmpty {
             let q = searchText.lowercased()
             result = result.filter { $0.message.lowercased().contains(q) }
@@ -375,11 +438,12 @@ struct LogWindowView: View {
                 Picker("", selection: $filterLevel) {
                     Text("All").tag(Optional<LogEntry.Level>.none)
                     Text("Info").tag(Optional<LogEntry.Level>.some(.info))
-                    Text("Warn").tag(Optional<LogEntry.Level>.some(.warn))
+                    Text("Warn+").tag(Optional<LogEntry.Level>.some(.warn))
                     Text("Error").tag(Optional<LogEntry.Level>.some(.error))
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 200)
                 .controlSize(.small)
+                .help("Warn+ shows warnings and errors together")
 
                 Button { log.copyAll() } label: {
                     Image(systemName: "doc.on.doc").font(.caption)
@@ -388,6 +452,16 @@ struct LogWindowView: View {
                 Button { log.openLogFile() } label: {
                     Image(systemName: "arrow.up.right.square").font(.caption)
                 }.buttonStyle(.bordered).help("Open the raw log file in Console or TextEdit")
+
+                Button { showClearConfirm = true } label: {
+                    Image(systemName: "trash").font(.caption)
+                }.buttonStyle(.bordered).help("Clear the log shown here — the saved log file on disk is not affected")
+                .confirmationDialog("Clear Log?", isPresented: $showClearConfirm, titleVisibility: .visible) {
+                    Button("Clear", role: .destructive) { log.clearDisplayedEntries() }
+                    Button("Cancel", role: .cancel) { }
+                } message: {
+                    Text("This clears the log shown here. The saved log file on disk is not affected.")
+                }
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
             .background(.bar)
@@ -406,18 +480,45 @@ struct LogWindowView: View {
             Divider()
 
             // ── Scrollable log ───────────────────────────────────────
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(visibleEntries) { entry in
-                            LogLineView(entry: entry).id(entry.id)
+            ZStack(alignment: .bottomTrailing) {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(visibleEntries) { entry in
+                                LogLineView(entry: entry).id(entry.id)
+                            }
+                            // 3.4: invisible sentinel — its visibility in the
+                            // viewport is how we know the user is following the
+                            // tail rather than having scrolled up to read
+                            // something. New lines only auto-scroll while this
+                            // is visible.
+                            Color.clear.frame(height: 1)
+                                .id(Self.bottomAnchorId)
+                                .onAppear { isAtBottom = true }
+                                .onDisappear { isAtBottom = false }
                         }
+                        .padding(.horizontal, 8).padding(.vertical, 4)
                     }
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                }
-                .onChange(of: log.entries.count) { _, _ in
-                    guard searchText.isEmpty, let last = visibleEntries.last else { return }
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                    .onChange(of: log.entries.count) { _, _ in
+                        guard searchText.isEmpty, isAtBottom, let last = visibleEntries.last else { return }
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                    .onChange(of: filterLevel) { _, _ in
+                        guard isAtBottom, let last = visibleEntries.last else { return }
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+
+                    if !isAtBottom && searchText.isEmpty {
+                        Button {
+                            withAnimation { proxy.scrollTo(Self.bottomAnchorId, anchor: .bottom) }
+                        } label: {
+                            Label("Jump to Latest", systemImage: "arrow.down.circle.fill")
+                                .font(.caption).fontWeight(.medium)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .padding(8)
+                    }
                 }
             }
         }

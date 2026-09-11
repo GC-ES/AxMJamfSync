@@ -165,6 +165,15 @@ final class LogService: ObservableObject {
         writeLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     }
 
+    /// 3.4: UI-only clear — resets what LogWindowView shows without touching the
+    /// on-disk file or rotation. Distinct from clearSession(), which is tied to a
+    /// new sync run actually starting (rotates the file, writes a session
+    /// header) — a manual "Clear Log" click in the UI must never do that.
+    func clearDisplayedEntries() {
+        entries   = []
+        warnCount = 0
+    }
+
     var allText: String { entries.map(\.fullLine).joined(separator: "\n") }
 
     func copyAll() {

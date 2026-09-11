@@ -12,6 +12,10 @@ struct ContentView: View {
   // Seeded from envStore.initialTab which is set synchronously in buildServices
   // before this view renders — eliminates the setup→dashboard flash.
   @State private var selectedTab: Tab
+  // 4.1: the underlying envStore.persistenceLoadFailed flag is never cleared
+  // (only a relaunch clears it), so without a local dismiss the alert would
+  // re-present itself the instant "Continue Without Syncing" is tapped.
+  @State private var dismissedPersistenceAlert = false
 
   init(appEngine: SyncEngine, initialTab: Tab = .setup) {
     self.appEngine     = appEngine
@@ -63,7 +67,8 @@ struct ContentView: View {
           tabs:      Tab.allCases,
           selected:  $selectedTab,
           isAllowed: isTabAllowed,
-          isRunning: appEngine.isRunning
+          isRunning: appEngine.isRunning,
+          hasUnviewedSyncIssue: appEngine.hasUnviewedIssue
         )
 
         Divider()
@@ -99,10 +104,16 @@ struct ContentView: View {
 
 
 
-    .onAppear { }
     .onChange(of: store.hasData) { _, newHasData in
       if newHasData, selectedTab == .setup { selectedTab = .dashboard }
       else if !newHasData { selectedTab = .setup }
+    }
+    // 3.5: visiting the Sync tab clears the unviewed-issue dot.
+    .onChange(of: selectedTab) { _, newTab in
+      if newTab == .sync { appEngine.markOutcomeSeen() }
+    }
+    .onAppear {
+      if selectedTab == .sync { appEngine.markOutcomeSeen() }
     }
 
     .onReceive(NotificationCenter.default.publisher(
@@ -113,10 +124,10 @@ struct ContentView: View {
     // sync run against an unavailable store. EnvironmentStore already blocks the
     // sync queue while this is set.
     .alert("Device database unavailable",
-           isPresented: Binding(get: { envStore.persistenceLoadFailed },
-                                set: { _ in })) {
+           isPresented: Binding(get: { envStore.persistenceLoadFailed && !dismissedPersistenceAlert },
+                                set: { if !$0 { dismissedPersistenceAlert = true } })) {
       Button("Quit", role: .destructive) { NSApplication.shared.terminate(nil) }
-      Button("Continue Without Syncing", role: .cancel) { }
+      Button("Continue Without Syncing", role: .cancel) { dismissedPersistenceAlert = true }
     } message: {
       Text((envStore.persistenceLoadFailureMessage.map { $0 + "\n\n" } ?? "")
            + "Syncing is disabled until the app is relaunched. Your existing data is not shown.")
@@ -301,6 +312,10 @@ struct AppTabBar: View {
     @Binding var selected: ContentView.Tab
     let isAllowed: (ContentView.Tab) -> Bool
     let isRunning: Bool
+    // 3.5: shows a small red dot on the Sync tab's icon when the last run ended
+    // in a non-success outcome the user hasn't looked at yet — cleared the moment
+    // they select the Sync tab (see ContentView's onChange(of: selectedTab)).
+    var hasUnviewedSyncIssue: Bool = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -315,6 +330,14 @@ struct AppTabBar: View {
                     VStack(spacing: 3) {
                         Image(systemName: tab.icon)
                             .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
+                            .overlay(alignment: .topTrailing) {
+                                if tab == .sync, !isRunning, hasUnviewedSyncIssue {
+                                    Circle()
+                                        .fill(Color.red)
+                                        .frame(width: 6, height: 6)
+                                        .offset(x: 5, y: -3)
+                                }
+                            }
                         Text(tab == .sync && isRunning ? "Sync ●" : tab.rawValue)
                             .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
                     }
@@ -413,7 +436,7 @@ struct AppHeaderBar: View {
                 .foregroundStyle(.primary)
             }
             if envStore.syncQueue.count > 1 {
-              Text("\(envStore.syncQueue.count - 1) environment\(envStore.syncQueue.count - 1 == 1 ? "" : "s") waiting")
+              Text("^[\(envStore.syncQueue.count - 1) environment](inflect: true) waiting")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             }
@@ -477,7 +500,7 @@ struct AboutPopover: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("AxM Jamf Sync")
                         .font(.headline)
-                    Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")")
+                    Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"))")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

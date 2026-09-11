@@ -565,7 +565,7 @@ private struct CommonDashboardFacetBar: View {
                     if let wb = store.commonDashboardWbFacet {
                         FacetActiveChip(label: wb.label) { store.commonDashboardWbFacet = nil }
                     }
-                    Text("\(matchCount) device\(matchCount == 1 ? "" : "s") match")
+                    Text("^[\(matchCount) device](inflect: true) match")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Clear All") { store.clearCommonDashboardFacets() }

@@ -37,6 +37,7 @@
 		B039 /* JamfDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A032 /* JamfDashboardView.swift */; };
 		B040 /* DashboardChartViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A033 /* DashboardChartViews.swift */; };
 		B041 /* SyncOutcome.swift in Sources */ = {isa = PBXBuildFile; fileRef = A034 /* SyncOutcome.swift */; };
+		B042 /* DiagnosticsExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A028 /* DiagnosticsExporter.swift */; };
 		B030 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = CEC1B53C2F5CB1AF00566E8D /* Assets.xcassets */; };
 		B031 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A024 /* PrivacyInfo.xcprivacy */; };
 /* End PBXBuildFile section */
@@ -74,6 +75,7 @@
 		A032 /* JamfDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JamfDashboardView.swift; sourceTree = "<group>"; };
 		A033 /* DashboardChartViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardChartViews.swift; sourceTree = "<group>"; };
 		A034 /* SyncOutcome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncOutcome.swift; sourceTree = "<group>"; };
+		A028 /* DiagnosticsExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsExporter.swift; sourceTree = "<group>"; };
 		A024 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		CEC1B53C2F5CB1AF00566E8D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		PROD /* AxMJamfSync.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AxMJamfSync.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -141,6 +143,7 @@
 				A032 /* JamfDashboardView.swift */,
 				A033 /* DashboardChartViews.swift */,
 				A034 /* SyncOutcome.swift */,
+				A028 /* DiagnosticsExporter.swift */,
 				A024 /* PrivacyInfo.xcprivacy */,
 				CEC1B53C2F5CB1AF00566E8D /* Assets.xcassets */,
 			);
@@ -247,6 +250,7 @@
 				B039 /* JamfDashboardView.swift in Sources */,
 				B040 /* DashboardChartViews.swift in Sources */,
 				B041 /* SyncOutcome.swift in Sources */,
+				B042 /* DiagnosticsExporter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -367,9 +371,6 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AxMJamfSync/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "AxM Jamf Sync";
-				INFOPLIST_KEY_CFBundleName = "AxM Jamf Sync";
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -400,9 +401,6 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AxMJamfSync/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "AxM Jamf Sync";
-				INFOPLIST_KEY_CFBundleName = "AxM Jamf Sync";
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

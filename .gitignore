@@ -68,3 +68,4 @@ docs/IMPLEMENTATION_PLAN.md
 fastlane/report.xml
 fastlane/screenshots/**/*.png
 fastlane/test_output
+test-jamf-mobile-patch.sh

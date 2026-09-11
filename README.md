@@ -16,7 +16,7 @@
 **Sync AppleCare warranty coverage from Apple Business Manager (ABM) or Apple School Manager (ASM) into Jamf Pro — across multiple environments, in four steps, on one Mac.**
 
 [![macOS](https://img.shields.io/badge/macOS-14.0+-blue.svg)](https://www.apple.com/macos/)
-[![Swift](https://img.shields.io/badge/Swift-5.9-orange.svg)](https://swift.org/)
+[![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org/)
 [![SwiftUI](https://img.shields.io/badge/SwiftUI-5.0-purple.svg)](https://developer.apple.com/xcode/swiftui/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Signed](https://img.shields.io/badge/Code%20Signed-✓-success.svg)](https://developer.apple.com/support/code-signing/)
@@ -38,6 +38,37 @@ AxM Jamf Sync runs a four-step pipeline on demand:
 | **4 — Jamf Update** | Writes warranty date, AppleCare agreement number, vendor, PO number, and PO date back to each matching Jamf record |
 
 The result: every device record in Jamf Pro shows accurate, up-to-date warranty and purchasing information pulled straight from Apple — no spreadsheets, no manual entry.
+
+---
+
+## What's new in v2.4 — Dashboard Focus Modes & Reliability
+
+v2.4 splits the Dashboard into focused views, closes several data-integrity gaps found during a deep architecture review, and polishes Setup, Sync, Devices, Export, and the environment sidebar.
+
+**Dashboard focus modes**
+- The Dashboard is now three views instead of one: **Default** (today's mixed ABM/ASM + Jamf reconciliation), **Apple** (everything scoped to your ABM/ASM-sourced fields), and **Jamf Pro** (everything scoped to Jamf-sourced fields) — pick a focus from the menu next to Run Sync
+- Each focus mode has its own facet filter bar (source, coverage, managed status, device type, FileVault, check-in freshness, product family, purchase source, and more) — filtering the Dashboard never touches the Devices tab's own filters
+- Every number on every card is tappable — it drills straight into the Devices tab pre-filtered to exactly what was counted, with any active facet carried along
+- New chart types: donut charts (product family, device type, FileVault), horizontal bar charts (purchase source, OS version), and a year-over-year trend chart (devices added to org) — all Swift Charts, animated, light/dark aware
+
+**Security & data integrity**
+- **Cached tokens are now scoped to a SHA-256 identity** (origin + client ID) — one environment can no longer load another's cached Apple or Jamf token, and a stale token can't survive a host or client-ID change within an environment
+- **Jamf write-back now re-validates the serial→device mapping** whenever the Jamf URL or client ID changes — previously a changed Jamf connection could silently PATCH warranty data onto the wrong physical machine using a stale cached mapping
+- **Sync runs report one of four honest outcomes** — Success, Partial, Failed, or Cancelled — instead of always looking like success even when part of a run failed
+- **Environment deletion now quiesces before it deletes** — any in-flight sync is stopped and Core Data is cleanly detached before files are removed, closing a race that could corrupt a store mid-delete
+- **AxM device fetch commits each batch to disk before advancing its resume checkpoint**, so an interrupted large fetch can never silently skip a page of devices on resume
+- **v1→v2 migration verifies the copied credentials and device count before deleting the originals** — a failed migration now leaves your original data completely untouched and retries next launch
+
+**Setup, Sync, Devices, Export, Sidebar**
+- Setup: credentials save automatically as you type — no more "Save to Keychain" checkbox — with a status line showing when each set was saved and last verified, and a masked Key ID next to your loaded private key
+- Sync: a redone Last Run Summary (Apple devices, Jamf devices, coverage checked, Jamf updated, Jamf failed, duration — each with a Mac/Mobile split), a resizable log pane that only auto-scrolls while you're already at the bottom (with a Jump to Latest button when you've scrolled up), a log Clear button, and a Warn+ log filter
+- Devices: search now also matches username, Jamf ID, AppleCare agreement number, MDM server, order number, and model identifier; select multiple devices at once to copy their serials or export just that selection; every device offers Copy Serial / Copy Jamf ID / **Open in Jamf Pro** from a right-click or the detail panel
+- Export: four new presets (Expiring in 30/31–60/61–90 Days, Write-back Failed), drag-to-reorder columns whose order and selection now actually persist across launches (previously silently didn't save at all), a **Show in Finder** button after export, and filenames that include the environment name
+- Sidebar: environment rows are now natively keyboard-navigable, show sync recency instead of a redundant scope label, and support inline rename (double-click the name, or press Return) — the delete icon only appears on hover
+- New **Help → Export Diagnostics…** — bundles app/environment metadata, a per-environment settings summary (never credentials or server hosts), and every log file into a zip, for sharing when troubleshooting
+
+### Upgrade Notes
+No migration required. Existing credentials, cache, and preferences carry over unchanged.
 
 ---
 
@@ -154,10 +185,10 @@ Select your team in **Signing & Capabilities**, then build with **⌘B**.
 ### 3 — Configure AxM Jamf Sync
 
 1. Launch the app — your setup opens in the sidebar as **Default**
-2. In **Setup → Apple Manager**, enter your Client ID and Key ID, load your `.pem` file
-3. Tick **Save to Keychain** and click **Test Auth** — green ✓
-4. In **Setup → Jamf Pro**, enter URL, Client ID, and Client Secret
-5. Tick **Save to Keychain** and click **Test Auth**
+2. In **Setup → Apple Manager**, enter your Client ID and Key ID, load your `.pem` file — it saves to the Keychain automatically as you type
+3. Click **Test Auth** — green ✓
+4. In **Setup → Jamf Pro**, enter URL, Client ID, and Client Secret — again, saved automatically
+5. Click **Test Auth**
 
 ### 4 — Run a sync
 
@@ -185,7 +216,7 @@ Full guides: [Project Wiki](https://github.com/karthikeyan-mac/AxMJamfSync/wiki)
 |-----|---------|
 | **Setup** | Credentials, cache settings, sync options |
 | **Sync** | Run, monitor, and stop syncs; view the live log |
-| **Dashboard** | Device counts, coverage breakdown, ring chart, last-run stats |
+| **Dashboard** | Default / Apple / Jamf Pro focus modes — device counts, coverage breakdown, charts, drill-downs, last-run stats |
 | **Devices** | Searchable, filterable table of every device |
 | **Export** | CSV export with presets and configurable columns |
 
@@ -247,13 +278,18 @@ AxMJamfSync/
 ├── EnvironmentSidebarView.swift  — Environment sidebar + Sync All button (v2)
 ├── SetupView.swift               — Credentials + settings UI
 ├── SyncPanelView.swift           — Sync progress and live log
-├── DashboardView.swift           — Stats tiles and coverage ring chart
-├── DevicesView.swift             — Device table with filtering
+├── DashboardView.swift           — Default focus dashboard (v2.4: + facet bar)
+├── AxMDashboardView.swift        — Apple-focused dashboard (v2.4)
+├── JamfDashboardView.swift       — Jamf-focused dashboard (v2.4)
+├── DashboardChartViews.swift     — Shared Swift Charts components (v2.4)
+├── DevicesView.swift             — Device table with filtering + multi-select
 ├── ExportView.swift              — CSV export with presets
 ├── SyncScheduler.swift           — Automatic scheduling engine (cron-based, v2.3)
 ├── CronExpression.swift          — 5-field POSIX cron parsing + next-fire-date (v2.3)
 ├── FriendlyCronBuilderView.swift — Plain-language schedule builder UI (v2.3)
-└── AppRunModeController.swift    — Dock vs. menu-bar-only toggle (v2.3)
+├── AppRunModeController.swift    — Dock vs. menu-bar-only toggle (v2.3)
+├── SyncOutcome.swift             — Four-state sync outcome (v2.4)
+└── DiagnosticsExporter.swift     — Help → Export Diagnostics… bundle (v2.4)
 ```
 ---
 

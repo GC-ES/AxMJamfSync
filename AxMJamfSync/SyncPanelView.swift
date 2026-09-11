@@ -366,6 +366,50 @@ struct SyncProgressBlock: View {
 
 // MARK: - Log Window (throttled 8fps, with search)
 
+// 4.hotfix2: a plain-SwiftUI stand-in for Picker(.segmented). The real
+// NSSegmentedControl-bridged picker's sizeThatFits is expensive enough that
+// even throttling LogWindowView's refresh to 8fps wasn't enough — it shares
+// the toolbar HStack with the "N lines"/"N warnings" counters, whose text
+// changes on every refresh force the whole row to re-measure, which in turn
+// re-triggers the segmented control's layout every single time. This control
+// looks the same but is built entirely from Text/Button/Capsule, so
+// re-measuring it costs nothing.
+private struct LogLevelFilterBar: View {
+    @Binding var selection: LogEntry.Level?
+    private static let options: [(label: String, value: LogEntry.Level?)] = [
+        ("All", nil), ("Info", .info), ("Warn+", .some(.warn)), ("Error", .some(.error))
+    ]
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(Self.options, id: \.label) { option in
+                let isSelected = selection == option.value
+                Button {
+                    selection = option.value
+                } label: {
+                    Text(option.label)
+                        .font(.caption2)
+                        .fontWeight(isSelected ? .semibold : .regular)
+                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .frame(maxWidth: .infinity)
+                        .background {
+                            if isSelected {
+                                Capsule().fill(Color(nsColor: .controlBackgroundColor))
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(Color(nsColor: .quaternaryLabelColor).opacity(0.25))
+        .clipShape(Capsule())
+        .frame(width: 200)
+        .help("Warn+ shows warnings and errors together")
+    }
+}
+
 struct LogWindowView: View {
     // 4.hotfix: NOT @ObservedObject. LogService.entries/warnCount are @Published,
     // and a large concurrent sync (e.g. Force Refresh Coverage over 1,000+
@@ -452,15 +496,7 @@ struct LogWindowView: View {
                 .background(.background.secondary)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
-                Picker("", selection: $filterLevel) {
-                    Text("All").tag(Optional<LogEntry.Level>.none)
-                    Text("Info").tag(Optional<LogEntry.Level>.some(.info))
-                    Text("Warn+").tag(Optional<LogEntry.Level>.some(.warn))
-                    Text("Error").tag(Optional<LogEntry.Level>.some(.error))
-                }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 200)
-                .controlSize(.small)
-                .help("Warn+ shows warnings and errors together")
+                LogLevelFilterBar(selection: $filterLevel)
 
                 Button { log.copyAll() } label: {
                     Image(systemName: "doc.on.doc").font(.caption)

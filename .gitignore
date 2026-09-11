@@ -57,6 +57,7 @@ Diagnostics-*.zip
 .claude/
 CLAUDE.md
 ARCHITECTURE.md
+SETUP_GUIDE.md
 docs/IMPLEMENTATION_PLAN.md
 
 # Editors / tools

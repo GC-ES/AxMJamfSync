@@ -126,6 +126,8 @@ Switch environments instantly from the sidebar. Existing v1 data migrates automa
 ![Sync UI](docs/screenshots/SyncUI.png)
 ![Scheduler UI](docs/screenshots/ScheduleUI.png)
 ![Dashboard UI](docs/screenshots/DashboardUI.png)
+![Dashboard — Apple Focus](docs/screenshots/Dashboard_Apple.png)
+![Dashboard — Jamf Pro Focus](docs/screenshots/Dashboard_JamfPro.png)
 ![Devices UI](docs/screenshots/DevicesUI.png)
 ![Export UI](docs/screenshots/ExportUI.png)
 

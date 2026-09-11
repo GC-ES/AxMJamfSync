@@ -16,6 +16,7 @@
 // to Latest" pill instead of yanking the view back down. Clear resets only
 // the in-memory entries shown here — the on-disk file/rotation is untouched.
 
+import Combine
 import SwiftUI
 
 // MARK: - SyncView
@@ -366,7 +367,23 @@ struct SyncProgressBlock: View {
 // MARK: - Log Window (throttled 8fps, with search)
 
 struct LogWindowView: View {
-    @ObservedObject var log: LogService
+    // 4.hotfix: NOT @ObservedObject. LogService.entries/warnCount are @Published,
+    // and a large concurrent sync (e.g. Force Refresh Coverage over 1,000+
+    // devices) can append a log line many times per second — @ObservedObject
+    // invalidates this view's ENTIRE body on every single one of those, with no
+    // way to read only the properties actually used. That includes the toolbar's
+    // segmented level-filter Picker, whose AppKit-bridged sizeThatFits is
+    // expensive enough that reflowing it at that rate pins the main thread and
+    // makes the whole app unresponsive (confirmed via a hang sample — the stack
+    // was 100% inside this view's body, dominated by SystemSegmentedControl
+    // layout). Fix: read log.entries/log.warnCount into local @State mirrors,
+    // refreshed via a throttled subscription to log.objectWillChange (see
+    // .onReceive below) instead of a live @Published binding — this is the
+    // "throttled 8fps" the file header above has always claimed but never
+    // actually implemented.
+    let log: LogService
+    @State private var displayedEntries:   [LogEntry] = []
+    @State private var displayedWarnCount: Int        = 0
     @State private var filterLevel: LogEntry.Level? = nil
     @State private var searchText:  String          = ""
     // 3.4: tracks whether the bottom-anchor row is currently visible in the
@@ -383,7 +400,7 @@ struct LogWindowView: View {
     // segmented control has no room for a genuine multi-select and "everything
     // at or above Warn" is what admins actually want when triaging a run.
     var visibleEntries: [LogEntry] {
-        var result = log.entries
+        var result = displayedEntries
         if let level = filterLevel {
             result = level == .warn
                 ? result.filter { $0.level == .warn || $0.level == .error }
@@ -405,15 +422,15 @@ struct LogWindowView: View {
                     .fontWeight(.medium)
                     .foregroundStyle(.primary)
 
-                if log.warnCount > 0 {
-                    Text("\(log.warnCount) warnings")
+                if displayedWarnCount > 0 {
+                    Text("\(displayedWarnCount) warnings")
                         .font(.caption2).fontWeight(.semibold)
                         .padding(.horizontal, 7).padding(.vertical, 2)
                         .background(Color.orange.opacity(0.15)).foregroundStyle(.orange)
                         .clipShape(Capsule())
                 }
-                if !log.entries.isEmpty {
-                    Text("\(log.entries.count) lines")
+                if !displayedEntries.isEmpty {
+                    Text("\(displayedEntries.count) lines")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -457,7 +474,11 @@ struct LogWindowView: View {
                     Image(systemName: "trash").font(.caption)
                 }.buttonStyle(.bordered).help("Clear the log shown here — the saved log file on disk is not affected")
                 .confirmationDialog("Clear Log?", isPresented: $showClearConfirm, titleVisibility: .visible) {
-                    Button("Clear", role: .destructive) { log.clearDisplayedEntries() }
+                    Button("Clear", role: .destructive) {
+                        log.clearDisplayedEntries()
+                        displayedEntries = []
+                        displayedWarnCount = 0
+                    }
                     Button("Cancel", role: .cancel) { }
                 } message: {
                     Text("This clears the log shown here. The saved log file on disk is not affected.")
@@ -469,7 +490,7 @@ struct LogWindowView: View {
             if !searchText.isEmpty {
                 Divider()
                 HStack {
-                    Text("\(visibleEntries.count) of \(log.entries.count) lines match: " + searchText)
+                    Text("\(visibleEntries.count) of \(displayedEntries.count) lines match: " + searchText)
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -499,7 +520,7 @@ struct LogWindowView: View {
                         }
                         .padding(.horizontal, 8).padding(.vertical, 4)
                     }
-                    .onChange(of: log.entries.count) { _, _ in
+                    .onChange(of: displayedEntries.count) { _, _ in
                         guard searchText.isEmpty, isAtBottom, let last = visibleEntries.last else { return }
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
@@ -525,6 +546,17 @@ struct LogWindowView: View {
         .background(.background.secondary)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator, lineWidth: 1))
+        .onAppear {
+            displayedEntries = log.entries
+            displayedWarnCount = log.warnCount
+        }
+        .onReceive(
+            log.objectWillChange
+                .throttle(for: .milliseconds(125), scheduler: DispatchQueue.main, latest: true)
+        ) { _ in
+            displayedEntries = log.entries
+            displayedWarnCount = log.warnCount
+        }
     }
 }
 

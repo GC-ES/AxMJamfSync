@@ -635,6 +635,7 @@ actor JamfService {
     /// Body: { "ios": { "purchasing": { "appleCareId": "…", "vendor": "…", "warrantyExpiresDate": "…" } } }
     func writeWarrantyBackMobile(
         mobileDeviceId: String,
+        serialNumber:   String,     // fallback `name` — see the blank-name retry below
         warrantyDate:   String?,    // YYYY-MM-DD — converted to ISO8601 for mobile API
         appleCareId:    String?,
         vendor:         String?,    // "purchaseSourceType (purchaseSourceId)"
@@ -673,16 +674,46 @@ actor JamfService {
             throw JamfError.networkError("Invalid mobile device ID: \(mobileDeviceId)")
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "PATCH"
-        request.setValue("Bearer \(resolvedToken)", forHTTPHeaderField: "Authorization")
-        request.setValue((Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { "AxMJamfSync/\($0)" } ?? "AxMJamfSync/1.1", forHTTPHeaderField: "User-Agent")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["ios": ["purchasing": purchasing]])
+        func send(_ body: [String: Any]) async throws -> (Data, URLResponse) {
+            var request = URLRequest(url: url)
+            request.httpMethod = "PATCH"
+            request.setValue("Bearer \(resolvedToken)", forHTTPHeaderField: "Authorization")
+            request.setValue((Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { "AxMJamfSync/\($0)" } ?? "AxMJamfSync/1.1", forHTTPHeaderField: "User-Agent")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            return try await session.data(for: request)
+        }
 
-        let (_, response) = try await session.data(for: request)
-        try validateHTTP(response, context: "Jamf PATCH /api/v2/mobile-devices/\(mobileDeviceId)")
+        let (data, response) = try await send(["ios": ["purchasing": purchasing]])
+
+        // Found via manual repro: a mobile device with no `name` set in Jamf
+        // rejects ANY purchasing-only PATCH with 400 INVALID_FIELD "name cannot
+        // be blank" — even though name isn't part of this request at all.
+        // Retry once, resending the same purchasing payload plus `name` (the
+        // serial number, since that's always available and stable). Jamf
+        // persists the name from that retry, so this is self-healing: every
+        // later write-back for this device succeeds on the first attempt.
+        if let http = response as? HTTPURLResponse, http.statusCode == 400,
+           Self.isBlankNameError(data) {
+            await log.warn("[Jamf] Mobile PATCH \(mobileDeviceId) rejected — device has no name set in Jamf. Retrying once with name=\(serialNumber).")
+            let (retryData, retryResponse) = try await send(["name": serialNumber, "ios": ["purchasing": purchasing]])
+            try await validateHTTP(retryResponse, data: retryData,
+                context: "Jamf PATCH /api/v2/mobile-devices/\(mobileDeviceId) (retry with name=serial)")
+            return
+        }
+
+        try await validateHTTP(response, data: data, context: "Jamf PATCH /api/v2/mobile-devices/\(mobileDeviceId)")
+    }
+
+    /// Matches Jamf's INVALID_FIELD "name cannot be blank" error on the mobile
+    /// devices v2 PATCH endpoint — see writeWarrantyBackMobile's retry above.
+    /// Matched on `field == "name"` rather than the description text, since
+    /// Jamf's error descriptions aren't a documented stable contract.
+    private nonisolated static func isBlankNameError(_ data: Data) -> Bool {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let errors = json["errors"] as? [[String: Any]] else { return false }
+        return errors.contains { ($0["field"] as? String) == "name" }
     }
 
     // MARK: - Token management

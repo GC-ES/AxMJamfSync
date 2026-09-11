@@ -1190,6 +1190,7 @@ final class SyncEngine: ObservableObject {
                                     if device.isMobile {
                                         try await jamfService.writeWarrantyBackMobile(
                                             mobileDeviceId: jamfId,
+                                            serialNumber:   device.serialNumber,
                                             warrantyDate:   device.axmCoverageEndDate,
                                             appleCareId:    device.axmAgreementNumber,
                                             vendor:         vendorStr,
@@ -1302,6 +1303,7 @@ final class SyncEngine: ObservableObject {
                                 if device.isMobile {
                                     try await jamfService.writeWarrantyBackMobile(
                                         mobileDeviceId: jamfId,
+                                        serialNumber:   device.serialNumber,
                                         warrantyDate:   device.axmCoverageEndDate,
                                         appleCareId:    device.axmAgreementNumber,
                                         vendor:         retryVendor,

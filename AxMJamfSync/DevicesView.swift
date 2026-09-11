@@ -75,7 +75,7 @@ struct DeviceFilterBar: View {
     private var hasActiveFilter: Bool {
         store.deviceTypeFilter != nil || store.deviceSourceFilter != nil ||
         store.coverageFilter   != nil || store.wbFilter            != nil ||
-        store.mdmServerFilter  != nil
+        store.mdmServerFilter  != nil || store.dashboardDrillDownDescription != nil
     }
 
     var body: some View {
@@ -116,6 +116,31 @@ struct DeviceFilterBar: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.leading, 2)
+
+                // Dashboard drill-down chip — shown only for filters that don't have
+                // their own dropdown below (OS version, FileVault, check-in freshness,
+                // product family, purchase source, added-to-org year, AxM status,
+                // Jamf managed/unmanaged). Distinct icon so it's clear this came from
+                // tapping a Dashboard number, not from a manual filter pick here.
+                if let drillDown = store.dashboardDrillDownDescription {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chart.bar.fill")
+                        Text(drillDown)
+                        Button {
+                            store.clearDrillDownFilters()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear this Dashboard filter")
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.12))
+                    .foregroundStyle(Color.accentColor)
+                    .clipShape(Capsule())
+                }
 
                 // Type
                 Menu {
@@ -239,7 +264,9 @@ struct DeviceFilterBar: View {
                     .fixedSize()
                 }
 
-                // Clear all filters
+                // Clear all filters — deliberately not deviceSearchText, which has its
+                // own clear button next to the search field and shouldn't be swept up
+                // by this one (matches this button's existing behavior).
                 if hasActiveFilter {
                     Button {
                         store.deviceTypeFilter   = nil
@@ -247,6 +274,7 @@ struct DeviceFilterBar: View {
                         store.coverageFilter     = nil
                         store.wbFilter           = nil
                         store.mdmServerFilter    = nil
+                        store.clearDrillDownFilters()
                     } label: {
                         Label("Clear", systemImage: "xmark.circle.fill")
                             .font(.caption)
@@ -335,10 +363,7 @@ struct DeviceListPanel: View {
                     Text("No devices match your filters")
                         .font(.headline)
                     Button("Clear Filters") {
-                        store.deviceSearchText   = ""
-                        store.deviceSourceFilter = nil
-                        store.coverageFilter     = nil
-                        store.wbFilter           = nil
+                        store.clearDeviceFilters()
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.regular)
@@ -364,7 +389,7 @@ struct DeviceListPanel: View {
 
 // MARK: - Device Row (image 2 style: model icon + serial + model)
 struct DeviceRow: View, Equatable {
-    static func == (lhs: DeviceRow, rhs: DeviceRow) -> Bool { lhs.device == rhs.device }
+    nonisolated static func == (lhs: DeviceRow, rhs: DeviceRow) -> Bool { lhs.device == rhs.device }
     @EnvironmentObject private var store: AppStore
     let device: Device
 
@@ -763,6 +788,10 @@ struct DeviceDetailPanel: View {
                             DetailGridRow(left:  ("Model",    device.jamfModel),
                                           right: ("MAC",      device.jamfMacAddress))
 
+                            // Hardware — processorType/RAM only populated for computers (v4 hardware section)
+                            DetailGridRow(left:  ("Processor", device.jamfProcessorType),
+                                          right: ("RAM",       device.jamfRamGB.map { "\($0) GB" }))
+
                             // System
                             DetailGridRow(left:  ("OS Version",  device.jamfOsVersion),
                                           right: ("FileVault",   device.jamfFileVaultStatus))
@@ -774,8 +803,15 @@ struct DeviceDetailPanel: View {
                                 left:  ("Report Date",  device.jamfReportDate.flatMap  { formatISO($0) }),
                                 right: ("Last Contact", device.jamfLastContact.flatMap { formatISO($0) })
                             )
-                            if let v = device.jamfLastEnrolled.flatMap({ formatISO($0) }) {
-                                DetailAttrRow(label: "Last Enrolled", value: v)
+                            // Enrolled Date (initialEntryDate) is when the device was first ever
+                            // added to Jamf; Last Enrolled is its most recent re-enrollment — the
+                            // two can differ for a device that's been wiped and re-enrolled since.
+                            DetailGridRow(
+                                left:  ("Enrolled Date", device.jamfInitialEntryDate),
+                                right: ("Last Enrolled", device.jamfLastEnrolled.flatMap { formatISO($0) })
+                            )
+                            if let v = device.jamfMdmCertExpiration.flatMap({ formatISO($0) }) {
+                                DetailAttrRow(label: "MDM Cert Expires", value: v)
                             }
 
                             // Warranty
@@ -1115,12 +1151,13 @@ struct DetailAttrRow: View {
 // P6: Static formatters — formatISO() was allocating 3 DateFormatter/ISO8601DateFormatter
 // instances on every call. Called for every date field in the detail panel on every render.
 // Statics are initialised once and shared across all calls.
-private let _isoFracParser: ISO8601DateFormatter = {
+// ISO8601DateFormatter is not Sendable-audited — nonisolated(unsafe), read-only.
+nonisolated(unsafe) private let _isoFracParser: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return f
 }()
-private let _isoPlainParser: ISO8601DateFormatter = {
+nonisolated(unsafe) private let _isoPlainParser: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withInternetDateTime]
     return f

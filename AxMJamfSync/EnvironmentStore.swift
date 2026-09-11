@@ -36,26 +36,57 @@ struct AppEnvironment: Identifiable, Codable, Equatable {
 }
 
 enum EnvironmentSyncStatus: String, Codable {
-  case never   // never synced
-  case success // last sync succeeded
-  case error   // last sync had errors
-  case running // sync in progress
+  case never     // never synced
+  case success   // last sync succeeded cleanly
+  case partial   // S7: last sync landed real data but was not a complete/fresh run
+  case error     // last sync failed
+  case cancelled // S7: last sync stopped by the user
+  case running   // sync in progress
 
   var icon: String {
     switch self {
-    case .never:   return "circle"
-    case .success: return "checkmark.circle.fill"
-    case .error:   return "exclamationmark.circle.fill"
-    case .running: return "arrow.triangle.2.circlepath.circle.fill"
+    case .never:     return "circle"
+    case .success:   return "checkmark.circle.fill"
+    case .partial:   return "exclamationmark.triangle.fill"
+    case .error:     return "exclamationmark.circle.fill"
+    case .cancelled: return "stop.circle.fill"
+    case .running:   return "arrow.triangle.2.circlepath.circle.fill"
     }
   }
 
   var color: Color {
     switch self {
-    case .never:   return .secondary
-    case .success: return .green
-    case .error:   return .orange
-    case .running: return .accentColor
+    case .never:     return .secondary
+    case .success:   return .green
+    case .partial:   return .orange
+    case .error:     return .red
+    case .cancelled: return .secondary
+    case .running:   return .accentColor
+    }
+  }
+}
+
+// MARK: - Migration errors
+
+/// S4: a typed failure from the v1→v2 migration. Every case means the migration
+/// stopped before its commit point with the v1 credentials/store left intact.
+/// `errorDescription` names the failing step without ever including a secret value.
+enum MigrationError: LocalizedError, Sendable {
+  case keychainCopyFailed(String)     // env-namespaced key that failed to write
+  case keychainVerifyFailed(String)   // env-namespaced key that did not read back
+  case storeCopyFailed(String)        // which file / stage failed
+  case storeVerifyFailed(String)      // why the staged store failed verification
+
+  var errorDescription: String? {
+    switch self {
+    case .keychainCopyFailed(let k):
+      return "A saved credential (\(k)) could not be copied to the new format. Your existing credentials are unchanged."
+    case .keychainVerifyFailed(let k):
+      return "A copied credential (\(k)) did not read back correctly. Your existing credentials are unchanged."
+    case .storeCopyFailed(let s):
+      return "The device database could not be copied (\(s)). Your existing data is unchanged."
+    case .storeVerifyFailed(let s):
+      return "The copied device database failed verification (\(s)). Your existing data is unchanged."
     }
   }
 }
@@ -90,8 +121,22 @@ final class EnvironmentStore: ObservableObject {
   /// True while the one-time v1→v2 CoreData migration is running.
   @Published private(set) var isMigrating: Bool = false
   @Published private(set) var migrationStatus: String = ""
+  /// Non-nil when the v1→v2 migration failed before its commit point. The v1
+  /// credentials/store are still intact and the migration retries on next launch;
+  /// this string is what the overlay shows the user.
+  @Published private(set) var migrationError: String? = nil
   /// Set synchronously in buildServices — ContentView reads this before first render.
   @Published private(set) var initialTab: ContentView.Tab = .setup
+
+  /// S7: terminal outcome of each environment's most recent run this session.
+  /// Read by SyncScheduler to build an accurate scheduled-run completion summary.
+  @Published private(set) var lastOutcomeByEnv: [UUID: SyncOutcome] = [:]
+
+  /// S7: true once any per-environment Core Data store has reported a load failure.
+  /// While set, the sync queue refuses to start — syncing against an unavailable
+  /// store would fetch everything and persist nothing. Cleared only by relaunch.
+  @Published private(set) var persistenceLoadFailed: Bool = false
+  @Published private(set) var persistenceLoadFailureMessage: String? = nil
 
   // MARK: - Sync Queue
   //
@@ -141,6 +186,14 @@ final class EnvironmentStore: ObservableObject {
   }
 
   init() {
+    NotificationCenter.default.addObserver(
+      forName: .persistenceLoadFailed, object: nil, queue: .main) { [weak self] note in
+        let msg = note.object as? String
+        Task { @MainActor in
+          self?.persistenceLoadFailed = true
+          self?.persistenceLoadFailureMessage = msg
+        }
+      }
     load()
     if environments.isEmpty {
       // First v2.0 launch — migration runs async; buildServices called at end of runMigration()
@@ -173,18 +226,33 @@ final class EnvironmentStore: ObservableObject {
     var env = env
     // ── Three-source scope resolution ────────────────────────────────────────
     // When Keychain is cleared, axm.scope and clientId are gone but dataCachedScope
-    // in UserDefaults survives. Use all three sources in priority order:
-    //   1. axm.scope Keychain key (most authoritative — written on every credential save)
-    //   2. clientId prefix (SCHOOLAPI* / BUSINESSAPI* — written with credentials)
-    //   3. dataCachedScope UserDefaults (survives Keychain wipe — written by SyncEngine)
-    let savedScopeRaw = KeychainService.loadForEnv(key: "axm.scope", envId: env.id) ?? ""
-    let clientIdRaw   = KeychainService.loadForEnv(key: "axm.clientId", envId: env.id) ?? ""
+    // in UserDefaults survives. Use sources in priority order:
+    //   1. Scoped clientId keys (axm.school.clientId / axm.business.clientId) — this is
+    //      the actual current storage format (see KeychainService.saveAxMCredentialsForEnv),
+    //      and directly observable ground truth: if real credentials exist under exactly
+    //      one scope, that's the scope in use, full stop.
+    //      PRIORITY FIX: this now runs BEFORE checking the axm.scope key. axm.scope is
+    //      just a label pointing at which credentials to use — it can itself become
+    //      wrong (that's exactly the bug this block used to have, and once "corrected"
+    //      incorrectly, axm.scope gets persisted with the bad value, so trusting it
+    //      first turns one bad inference into a permanent one). Real credential presence
+    //      can't lie the same way, so it must outrank the label.
+    //   2. axm.scope Keychain key — trusted only when scoped-key evidence is ambiguous
+    //      (both or neither populated).
+    //   3. Legacy unscoped clientId prefix (SCHOOLAPI* / BUSINESSAPI*) — pre-migration format
+    //   4. dataCachedScope UserDefaults (survives Keychain wipe — written by SyncEngine)
+    let savedScopeRaw          = KeychainService.loadForEnv(key: "axm.scope", envId: env.id) ?? ""
+    let scopedSchoolClientId   = KeychainService.loadForEnv(key: "axm.school.clientId",   envId: env.id) ?? ""
+    let scopedBusinessClientId = KeychainService.loadForEnv(key: "axm.business.clientId", envId: env.id) ?? ""
+    let legacyClientIdRaw      = KeychainService.loadForEnv(key: "axm.clientId", envId: env.id) ?? ""
     let cachedPrefs   = AppPreferences(environmentId: env.id)
     let inferredScope: AxMScope? = {
+      if !scopedSchoolClientId.isEmpty   && scopedBusinessClientId.isEmpty { return .school }
+      if !scopedBusinessClientId.isEmpty && scopedSchoolClientId.isEmpty   { return .business }
       if let s = AxMScope(rawValue: savedScopeRaw) { return s }
-      if clientIdRaw.uppercased().hasPrefix("SCHOOLAPI")   { return .school }
-      if clientIdRaw.uppercased().hasPrefix("BUSINESSAPI") { return .business }
-      // Fallback 3: scope of the data already in CoreData — written by SyncEngine at sync end
+      if legacyClientIdRaw.uppercased().hasPrefix("SCHOOLAPI")   { return .school }
+      if legacyClientIdRaw.uppercased().hasPrefix("BUSINESSAPI") { return .business }
+      // Fallback 4: scope of the data already in CoreData — written by SyncEngine at sync end
       if let s = AxMScope(rawValue: cachedPrefs.dataCachedScope) { return s }
       return nil
     }()
@@ -198,6 +266,11 @@ final class EnvironmentStore: ObservableObject {
       let correctedRaw = correctedScope.rawValue
       if cachedPrefs.dataCachedScope != correctedRaw { cachedPrefs.dataCachedScope = correctedRaw }
       if cachedPrefs.activeScope     != correctedRaw { cachedPrefs.activeScope     = correctedRaw }
+      // Persist the authoritative Keychain key too, so future launches resolve via
+      // fallback 1 directly instead of re-inferring from scoped clientId keys every time.
+      if savedScopeRaw != correctedRaw {
+        _ = KeychainService.saveForEnv(correctedRaw, key: "axm.scope", envId: env.id)
+      }
     }
 
     // ── Keychain key migration ───────────────────────────────────────────────
@@ -224,6 +297,16 @@ final class EnvironmentStore: ObservableObject {
     let logService   = LogService.makeForEnvironment(id: env.id)
     activeStore      = AppStore(environment: env, persistence: persistence, prefs: prefs)
 
+    // S2: when a Jamf URL/clientId change invalidates the cached serial→Jamf-ID
+    // mapping, immediately queue a full Jamf re-fetch for this environment so the
+    // user never has to remember to trigger "force refresh". forceFullJamfRefetch
+    // is a one-shot consumed by SyncEngine.run(); enqueue() dedups by env id.
+    activeStore.onJamfRebindingDetected = { [weak self, weak store = activeStore] in
+      guard let self, let store, let envId = store.environmentId else { return }
+      store.prefs.forceFullJamfRefetch = true
+      self.enqueue(envId)
+    }
+
     // If an engine is already running for this environment — whether it is the
     // current activeSyncEngine or a previously-active engine the user switched
     // away from — reuse it. This preserves the live isRunning / progress state
@@ -243,6 +326,15 @@ final class EnvironmentStore: ObservableObject {
           self.runningEngines[envId] = engine
         } else {
           self.runningEngines.removeValue(forKey: envId)
+          // S7: record the terminal outcome so a scheduled run's summary reflects
+          // what actually happened, not merely that the queue drained.
+          switch status {
+          case .success:   self.lastOutcomeByEnv[envId] = .success
+          case .partial:   self.lastOutcomeByEnv[envId] = .partial
+          case .cancelled: self.lastOutcomeByEnv[envId] = .cancelled
+          case .error:     self.lastOutcomeByEnv[envId] = .failed
+          case .never, .running: break
+          }
         }
         self.updateSyncStatus(envId, status: status, date: date)
       }
@@ -279,9 +371,57 @@ final class EnvironmentStore: ObservableObject {
     save()
   }
 
-  /// Returns true if this environment can be deleted.
-  /// The last remaining environment cannot be deleted — the app requires at least one.
-  func canDelete(_ id: UUID) -> Bool { environments.count > 1 }
+  // MARK: - Deletion eligibility (S5)
+
+  /// Why an environment can't be deleted right now, or nil if it can.
+  enum DeletionBlockReason: Equatable {
+    case lastEnvironment
+    case running
+    case queued
+
+    var userMessage: String {
+      switch self {
+      case .lastEnvironment: return "The app needs at least one environment."
+      case .running:         return "Can't delete — sync in progress."
+      case .queued:          return "Can't delete — queued for scheduled sync."
+      }
+    }
+  }
+
+  enum EnvironmentDeletionError: LocalizedError {
+    case blocked(DeletionBlockReason)
+    case teardownFailed(String)
+
+    var errorDescription: String? {
+      switch self {
+      case .blocked(let r):        return r.userMessage
+      case .teardownFailed(let m): return "The environment could not be fully removed (\(m)). Nothing was deleted from the environment list — try again."
+      }
+    }
+  }
+
+  /// True while `id` has a live, running sync — checked against the same
+  /// `runningEngines` map and active engine the queue runner resolves slots from.
+  func isRunning(_ id: UUID) -> Bool {
+    if let e = runningEngines[id], e.isRunning { return true }
+    if activeSyncEngine.environmentId == id, activeSyncEngine.isRunning { return true }
+    return false
+  }
+
+  /// True while `id` sits anywhere in the sync queue — index 0 (the active slot)
+  /// included. `syncQueue` is the same array `startQueueRunner` dequeues from
+  /// (S6), so this can't disagree with what the runner would execute.
+  func isQueued(_ id: UUID) -> Bool { syncQueue.contains(id) }
+
+  func deletionBlockReason(_ id: UUID) -> DeletionBlockReason? {
+    if environments.count <= 1 { return .lastEnvironment }
+    if isRunning(id)           { return .running }
+    if isQueued(id)            { return .queued }
+    return nil
+  }
+
+  /// Returns true if this environment can be deleted right now.
+  func canDelete(_ id: UUID) -> Bool { deletionBlockReason(id) == nil }
 
   /// Update the scope of an environment — persists the change so buildServices
   /// always loads the correct scope on the next switch or relaunch.
@@ -291,17 +431,62 @@ final class EnvironmentStore: ObservableObject {
     save()
   }
 
-  func delete(_ id: UUID) {
-    guard canDelete(id) else { return }
-    wipeEnvironmentData(id: id)
+  /// S5: quiesce every context that could still be writing to this environment,
+  /// detach its Core Data coordinator and close its log file, THEN remove the
+  /// on-disk data, and only after all of that succeeds drop the registry entry.
+  /// Order matters — detach before delete, never delete before detach, or the
+  /// coordinator keeps writing to an unlinked inode and the writes vanish.
+  func delete(_ id: UUID) async throws {
+    // Re-check at the point of deletion — state may have changed since the UI
+    // last evaluated canDelete (a scheduled run could have enqueued it).
+    if let reason = deletionBlockReason(id) {
+      throw EnvironmentDeletionError.blocked(reason)
+    }
+    guard environments.contains(where: { $0.id == id }) else { return }
+
+    let wasActive = (activeEnvironmentId == id)
+
+    // 1. Quiesce any in-flight work. deletionBlockReason already rejected a
+    //    *running* sync, but a run that finished microseconds ago may still be
+    //    unwinding — await it cleanly (bounded) rather than racing teardown.
+    if let engine = runningEngines[id] { await engine.cancelAndWait() }
+    if wasActive, activeSyncEngine.environmentId == id { await activeSyncEngine.cancelAndWait() }
+
+    // 2. Capture the live store/log for this env, then switch the active pointers
+    //    away FIRST so no view or engine keeps using the store we're about to
+    //    detach.
+    let storeToDetach = wasActive ? activeStore.persistence
+                                  : PersistenceController.loadedStore(for: id)
+    let logToClose    = LogService.envInstance(for: id)
+
+    if wasActive {
+      activeEnvironmentId = environments.first(where: { $0.id != id })?.id
+      if let id = activeEnvironmentId { ud.set(id.uuidString, forKey: activeKey) }
+      if let env = activeEnvironment { buildServices(for: env) }
+    }
+
+    // 3. Drain pending persistence, close the log handle, detach the coordinator —
+    //    all BEFORE any file removal.
+    if let storeToDetach {
+      await storeToDetach.viewContext.perform { }   // let queued saves land
+    }
+    logToClose?.closeForDeletion()
+    storeToDetach?.detach()
+
+    // 4. Remove Keychain items, preferences, log files and the SQLite store.
+    //    A failure to remove the store files is fatal to the operation — we must
+    //    not leave a registry entry pointing at half-deleted data.
+    do {
+      try wipeEnvironmentData(id: id)
+    } catch {
+      throw EnvironmentDeletionError.teardownFailed(error.localizedDescription)
+    }
+
+    // 5. Only now drop the registry metadata.
+    runningEngines.removeValue(forKey: id)
+    lastOutcomeByEnv.removeValue(forKey: id)
     environments.removeAll { $0.id == id }
     save()
-    if activeEnvironmentId == id {
-      activeEnvironmentId = environments.first?.id
-      if let env = activeEnvironment {
-        buildServices(for: env)
-      }
-    }
   }
 
   func setActive(_ id: UUID) {
@@ -323,6 +508,10 @@ final class EnvironmentStore: ObservableObject {
   /// If the runner is idle this starts it immediately.
   /// Called by both Run Sync (single env) and the multi-sync popover.
   func enqueue(_ id: UUID) {
+    guard !persistenceLoadFailed else {
+      os_log(.error, "[EnvironmentStore] enqueue refused — device database unavailable; relaunch required.")
+      return
+    }
     guard environments.contains(where: { $0.id == id }) else { return }
     guard !syncQueue.contains(id) else { return }
     syncQueue.append(id)
@@ -331,6 +520,10 @@ final class EnvironmentStore: ObservableObject {
 
   /// Appends all IDs in order, deduplicating. Starts the runner if idle.
   func enqueueMultiSync(ids: [UUID]) {
+    guard !persistenceLoadFailed else {
+      os_log(.error, "[EnvironmentStore] multi-sync refused — device database unavailable; relaunch required.")
+      return
+    }
     for id in ids {
       guard environments.contains(where: { $0.id == id }) else { continue }
       guard !syncQueue.contains(id) else { continue }
@@ -373,18 +566,30 @@ final class EnvironmentStore: ObservableObject {
       while !syncQueue.isEmpty && !Task.isCancelled {
         let envId = syncQueue[0]
 
-        if activeEnvironmentId != envId {
-          setActive(envId)
-          // Wait for buildServices to complete and SwiftUI to inject the new
-          // activeSyncEngine before we call run() on it.
-          try? await Task.sleep(for: .milliseconds(300))
-          guard !Task.isCancelled else { break }
+        guard environments.contains(where: { $0.id == envId }) else {
+          syncQueue.removeFirst()   // environment deleted while it sat in the queue
+          continue
         }
 
-        // Capture engine + store as locals so environment switches by the user
-        // during this slot don't affect which engine we're polling.
-        let engine = activeSyncEngine
+        // S6: resolve and capture this slot's engine + store BEFORE any suspension
+        // point. setActive → buildServices runs synchronously, so activeSyncEngine /
+        // activeStore are already this environment's the instant setActive returns.
+        // Capturing after an await would let a UI setActive() during the gap
+        // redirect this slot to whatever environment the user just clicked, while
+        // the queue still believed it was running `envId`.
+        if activeEnvironmentId != envId { setActive(envId) }
+        let engine = runningEngines[envId] ?? activeSyncEngine
         let store  = activeStore
+
+        guard engine.environmentId == envId, store.environmentId == envId else {
+          os_log(.error,
+                 "[EnvironmentStore] Queue slot identity mismatch for %{public}@ (engine=%{public}@ store=%{public}@) — aborting slot.",
+                 envId.uuidString,
+                 engine.environmentId?.uuidString ?? "nil",
+                 store.environmentId?.uuidString ?? "nil")
+          if syncQueue.first == envId { syncQueue.removeFirst() }
+          continue
+        }
 
         if engine.isRunning {
           // A manual Run Sync was already triggered on this environment — wait for it.
@@ -392,9 +597,17 @@ final class EnvironmentStore: ObservableObject {
             try? await Task.sleep(for: .milliseconds(500))
           }
         } else {
+          // Brief settle so isRunning / UI injection catch up. A setActive() by the
+          // user during this window is harmless now — engine and store are bound.
+          try? await Task.sleep(for: .milliseconds(300))
+          guard !Task.isCancelled,
+                syncQueue.first == envId,
+                environments.contains(where: { $0.id == envId }) else {
+            if syncQueue.first == envId { syncQueue.removeFirst() }
+            continue   // unqueued or deleted during the settle — do not substitute
+          }
           engine.run(store: store)
-          // Poll until the engine signals completion.
-          // Use a short initial sleep so isRunning = true has time to propagate.
+          // Short initial sleep so isRunning = true has time to propagate.
           try? await Task.sleep(for: .milliseconds(100))
           while engine.isRunning && !Task.isCancelled {
             try? await Task.sleep(for: .milliseconds(500))
@@ -447,6 +660,7 @@ final class EnvironmentStore: ObservableObject {
   /// then builds services and clears the flag — all on MainActor.
   private func startMigration() {
     isMigrating     = true
+    migrationError  = nil
     migrationStatus = "Preparing migration…"
 
     Task {
@@ -459,18 +673,38 @@ final class EnvironmentStore: ObservableObject {
     let scopeRaw  = UserDefaults.standard.string(forKey: "activeScope") ?? ""
     let scope     = AxMScope(rawValue: scopeRaw) ?? .business
 
+    // ── Step 1: credentials — copy each one AND read it back to confirm it
+    // round-trips. v1 flat keys are not touched.
     migrationStatus = "Migrating credentials…"
-    KeychainService.migrateToEnvironment(id: defaultId, scope: scope)
+    if case .failure(let err) = KeychainService.migrateToEnvironment(id: defaultId, scope: scope) {
+      failMigration(err)
+      return
+    }
 
+    // ── Step 2: device store — stage the copy, verify it loads with the same
+    // device count as v1, then move it atomically into place. On any failure
+    // nothing is moved and the v1 store is left byte-for-byte intact.
     migrationStatus = "Migrating device data…"
-    // Run CoreData migration on a background thread — it can be slow for large stores
-    await Task.detached(priority: .userInitiated) {
-      _ = PersistenceController(environmentId: defaultId)
-    }.value
+    let destURL = PersistenceController.environmentStoreURL(defaultId)
+    do {
+      try FileManager.default.createDirectory(
+        at: PersistenceController.environmentsDirectory, withIntermediateDirectories: true)
+      let count = try await Task.detached(priority: .userInitiated) {
+        try PersistenceController.stageAndVerifyV1Copy(to: destURL)
+      }.value
+      os_log(.default, "[EnvironmentStore] v1 store migrated and verified — %d device(s).", count)
+    } catch {
+      failMigration(error)
+      return
+    }
 
+    // ── Step 3: preferences (UserDefaults — synchronous, per-key, low risk).
     migrationStatus = "Migrating preferences…"
     AppPreferences.migrateToEnvironment(id: defaultId)
 
+    // ── Commit: both verifications passed. Persisting the environment list is
+    // what stops the migration re-running on the next launch, so it must come
+    // only after everything above has succeeded.
     var env = AppEnvironment(id: defaultId, name: "Default", scope: scope)
     env.lastSyncStatus = .never
     environments        = [env]
@@ -478,14 +712,27 @@ final class EnvironmentStore: ObservableObject {
     save()
     os_log(.default, "[EnvironmentStore] Migration complete — Default environment (%{public}@)", defaultId.uuidString)
 
-    // Build services for the default environment now that migration is complete
     buildServices(for: env)
 
-    // Step 3: now that CoreData, UserDefaults, and services are all confirmed
-    // working, delete the v1 flat Keychain keys. Done last so there is a full
-    // rollback window if anything earlier failed.
+    // ── Legacy cleanup — only now, after a fully verified and committed
+    // migration. If anything above failed we returned early and these flat keys
+    // are still the app's only copy of the credentials.
     KeychainService.deleteV1KeychainKeys()
 
+    migrationStatus = ""
+    migrationError  = nil
+    isMigrating     = false
+  }
+
+  /// Migration hit an unrecoverable error before the commit point. v1 credentials
+  /// and the v1 store are still fully intact; `environments` is left empty so the
+  /// migration retries on the next launch, and the overlay shows `message`.
+  private func failMigration(_ error: Error) {
+    let message = (error as? LocalizedError)?.errorDescription ?? "Migration could not be completed."
+    os_log(.error,
+           "[EnvironmentStore] Migration FAILED — %{public}@ — v1 data left intact; will retry on next launch.",
+           message)
+    migrationError  = message
     migrationStatus = ""
     isMigrating     = false
   }
@@ -497,13 +744,17 @@ final class EnvironmentStore: ObservableObject {
 
   // MARK: - Data wipe (on environment deletion)
 
-  private func wipeEnvironmentData(id: UUID) {
+  /// S5: caller (`delete`) must have already detached the Core Data coordinator and
+  /// closed the log handle. Throws if the SQLite store files can't be removed — a
+  /// present store file is what makes a future launch treat the env as still-valid,
+  /// so a half-deleted store must not be reported as a clean wipe. Keychain /
+  /// preferences / log removal are best-effort (logged, not fatal).
+  private func wipeEnvironmentData(id: UUID) throws {
     KeychainService.wipeEnvironment(id: id)
     AppPreferences.wipeEnvironment(id: id)
-    PersistenceController.wipeEnvironment(id: id)
+    try PersistenceController.wipeEnvironment(id: id)   // fatal on failure
     LogService.wipeEnvironmentLog(id: id)
     LogService.evictEnvironment(id: id)
-    runningEngines.removeValue(forKey: id)
     os_log(.default, "[EnvironmentStore] Wiped all data for environment %{public}@", id.uuidString)
   }
 }

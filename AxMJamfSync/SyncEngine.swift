@@ -14,6 +14,7 @@
 import Foundation
 import SwiftUI
 import UserNotifications
+import os
 
 @MainActor
 final class SyncEngine: ObservableObject {
@@ -24,6 +25,9 @@ final class SyncEngine: ObservableObject {
     @Published var stepLabel:   String    = ""
     @Published var isRunning:   Bool      = false
     @Published var lastError:   String?   = nil
+    // S7: four-state result of the most recent finished run. Never `.success`
+    // unless every stage completed and persisted. Restored from prefs in init().
+    @Published var lastOutcome: SyncOutcome = .success
 
     // Last-run summary counts (shown in SyncView after completion)
     @Published var lastRunAxm:      String = "—"
@@ -74,6 +78,8 @@ final class SyncEngine: ObservableObject {
 
     init() {
         let ud = UserDefaults.standard
+        if let raw = ud.string(forKey: PrefKey.lrOutcome),
+           let o = SyncOutcome(rawValue: raw) { lastOutcome = o }
         let epoch = ud.double(forKey: PrefKey.lrDateEpoch)
         guard epoch > 0 else { return }   // no previous run recorded
         let secs = ud.integer(forKey: PrefKey.lrElapsedSecs)
@@ -117,8 +123,13 @@ final class SyncEngine: ObservableObject {
         // Snapshot the one-shot flags BEFORE clearing them so _run can honour them
         let forceDevices  = store.prefs.alwaysRefreshDevices
         let forceCoverage = store.prefs.alwaysRefreshCoverage
+        // S2: one-shot — set by EnvironmentStore when the Jamf URL/clientId changed.
+        // Forces a full Jamf inventory re-fetch (Step 2 only; Apple Step 1 stays
+        // cache-governed) so the serial→Jamf-ID map is rebuilt against the new host.
+        let forceJamf     = store.prefs.forceFullJamfRefetch
         store.prefs.alwaysRefreshDevices  = false
         store.prefs.alwaysRefreshCoverage = false
+        store.prefs.forceFullJamfRefetch  = false
         // Only request notification authorisation when status is undetermined —
         // re-requesting after grant/deny is a no-op but avoids an unnecessary system call.
         UNUserNotificationCenter.current().getNotificationSettings { settings in
@@ -128,7 +139,7 @@ final class SyncEngine: ObservableObject {
         }
         tabBadge = "●"
         NSApp.dockTile.badgeLabel = "1/4"
-        syncTask = Task { await _run(store: store, forceDevices: forceDevices, forceCoverage: forceCoverage) }
+        syncTask = Task { await _run(store: store, forceDevices: forceDevices, forceCoverage: forceCoverage, forceJamf: forceJamf) }
     }
 
     func stop() {
@@ -141,6 +152,30 @@ final class SyncEngine: ObservableObject {
         // Token cleanup happens in _run's finally block after CancellationError is caught
     }
 
+    /// S5: explicit request-and-await cancellation. Unlike `stop()` (fire-and-forget,
+    /// used by the queue runner) this suspends until `_run` has actually finished
+    /// unwinding — its CancellationError handler flushes partial data and the tail
+    /// invalidates tokens and clears `isRunning`. A bounded timeout keeps a wedged
+    /// run from blocking teardown forever. No-op when idle.
+    func cancelAndWait(timeout: Duration = .seconds(10)) async {
+        guard let task = syncTask else { return }
+        syncTask  = nil
+        task.cancel()
+        stepLabel = "Stopping…"
+        tabBadge  = ""
+        NSApp.dockTile.badgeLabel = nil
+        let timedOut = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await task.value; return false }
+            group.addTask { try? await Task.sleep(for: timeout); return true }
+            let first = await group.next() ?? true
+            group.cancelAll()
+            return first
+        }
+        if timedOut {
+            os_log(.error, "[SyncEngine] cancelAndWait — run did not finish within the timeout; proceeding with teardown.")
+        }
+    }
+
     func resetCache(store: AppStore) async {
         await store.wipeCache()
         log.info("Cache reset — CoreData wiped, timestamps cleared.")
@@ -148,11 +183,46 @@ final class SyncEngine: ObservableObject {
 
     // MARK: - Main pipeline
 
-    private func _run(store: AppStore, forceDevices: Bool = false, forceCoverage: Bool = false) async {
+    private func _run(store: AppStore, forceDevices: Bool = false, forceCoverage: Bool = false, forceJamf: Bool = false) async {
+        // S1: services are built with an immutable environment identity taken here,
+        // once, from the store — never looked up again mid-pipeline. Abort rather
+        // than run against an ambiguous or mismatched identity.
+        func abort(_ reason: String) {
+            log.error("Sync aborted before start — \(reason).")
+            phase = .error
+            lastError = "Internal error: \(reason)."
+            tabBadge = ""
+            NSApp.dockTile.badgeLabel = nil
+            lastOutcome = .failed
+            onSyncStatusChange?(.error, Date())
+        }
+        guard let envId = store.environmentId else {
+            abort("store has no environment identity")
+            return
+        }
+        if let engineEnv = environmentId, engineEnv != envId {
+            abort("engine and store belong to different environments")
+            return
+        }
+        // S7: never sync against a store that failed to load — the run would fetch
+        // 21k devices and silently fail to persist any of them. Surface it distinctly
+        // and let the .persistenceLoadFailed observer drive the UI.
+        guard store.isStoreReady else {
+            abort("device database unavailable — \(store.persistence.storeLoadError ?? "store did not load")")
+            NotificationCenter.default.post(name: .persistenceLoadFailed,
+                                            object: store.persistence.storeLoadError ?? "store did not load")
+            return
+        }
+
+        // S7: outcome accumulator — starts clean, only ever downgraded (never upgraded).
+        var outcome: SyncOutcome = .success
+        func mark(_ o: SyncOutcome) { outcome = outcome.downgraded(to: o) }
+
         isRunning   = true
         lastError   = nil
         phase       = .idle
         currentStep = 0
+        store.resetPersistenceFailureFlag()   // S7: fresh slate for this run's save-failure latch
         onSyncStatusChange?(.running, nil)
         totalSteps  = 1
         store.suppressAutoReload = true   // SyncEngine controls reload timing during sync
@@ -161,6 +231,8 @@ final class SyncEngine: ObservableObject {
 
         let prefs    = store.prefs
         let pageSize = max(store.jamfCredentials.pageSize, 10)
+        // S9: this environment's scoped log, captured for the concurrent task groups below.
+        let runLog   = log
 
         // ── Settings dump — file log only, not shown in UI log window ────
         // Written at the top of every run so troubleshooting always has full context.
@@ -173,7 +245,7 @@ final class SyncEngine: ObservableObject {
         log.debug("────────────────────────────────────────────────────────")
         log.debug("APP VERSION  \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"))")
         log.debug("── Scope & Credentials ─────────────────────────────────")
-        log.debug("Scope          : \(axmCreds.scope == .school ? "ASM (Apple School Manager)" : "ABM (Apple Business Manager)")")
+        log.debug("Scope          : \(axmCreds.scope == .school ? "ASM (Apple School Manager)" : "ABM (Apple Business)")")
         log.debug("AxM Client ID  : \(axmCreds.clientId.isEmpty ? "(not set)" : "(set)")")
         log.debug("AxM Key ID     : \(axmCreds.keyId.isEmpty ? "(not set)" : "(set)")")
         log.debug("AxM Private Key: \(axmCreds.privateKeyContent.isEmpty ? "(not set)" : "set (\(axmCreds.privateKeyContent.count) chars)")")
@@ -213,10 +285,30 @@ final class SyncEngine: ObservableObject {
         var runWBSyncedMob   = 0   // Mobile write-back successes this run
         var runWBFailedMob   = 0   // Mobile write-back failures this run
 
+        // S7: shared tail for a thrown error mid-run. Previously these catch blocks
+        // set phase/lastError but never called onSyncStatusChange — so EnvironmentStore
+        // never cleared the environment from `runningEngines` and the sidebar stayed
+        // stuck on "running". They also always looked like a hard failure even when
+        // real data had already been persisted (S3 batch commits, earlier steps).
+        func handleRunError(_ message: String) {
+            let anyProgress = runAxmCount > 0 || runJamfCount > 0
+                || runCoverageCount > 0 || runWBSynced > 0
+            mark(anyProgress ? .partial : .failed)
+            phase       = outcome == .failed ? .error : .done
+            lastError   = message
+            lastOutcome = outcome
+            stepLabel   = "\(outcome.label): \(message)"
+            store.prefs.lrOutcome = outcome.rawValue
+            log.error(message)
+            onSyncStatusChange?(outcome.environmentStatus, Date())
+            if outcome == .failed { SyncNotificationService.sendError(message: message) }
+            else { SyncNotificationService.sendPartial(detail: message) }
+        }
+
         // Build real service actors from credentials stored in AppStore (loaded from Keychain).
         // Fresh actors each run — no stale token state carried over.
-        let abmService  = ABMService(credentials: store.axmCredentials)
-        let jamfService = JamfService(credentials: store.jamfCredentials)
+        let abmService  = ABMService(credentials: store.axmCredentials, environmentId: envId, log: log)
+        let jamfService = JamfService(credentials: store.jamfCredentials, environmentId: envId, log: log)
         activeABM  = abmService
         activeJamf = jamfService
 
@@ -232,6 +324,17 @@ final class SyncEngine: ObservableObject {
         var covBatch:  [Device]               = []
 
         do {
+            // ── S2: Jamf rebinding — re-assert the revalidation gate ─────
+            // saveJamfCredentials() already marked mappings pending, but that ran on a
+            // detached Task that could race this run's merge snapshot. Re-mark here,
+            // synchronously ahead of any fetch, so every serial the upcoming full Jamf
+            // re-fetch does NOT re-match stays gated against write-back.
+            if forceJamf {
+                await store.persistence.markJamfMappingsPendingRevalidation()
+                await store.loadDevicesFromCoreDataSync()
+                log.info("S2 — Jamf connection changed: all \(store.devices.filter { $0.jamfId != nil }.count) mapped device(s) held from write-back until re-matched against the new host.")
+            }
+
             // ── Step 1: AxM Devices ──────────────────────────────────────
 
             // Auto-test AxM auth using the already-built abmService actor — avoids creating
@@ -257,6 +360,7 @@ final class SyncEngine: ObservableObject {
                     } catch {
                         store.axmAuthStatus = .failure(error.localizedDescription)
                         log.error("Step 1/4 — AxM auth failed: \(error.localizedDescription). Skipping AxM fetch.")
+                        mark(.partial)   // S7: Apple side contributed nothing this run
                         // Do NOT attempt the fetch — the token is invalid and would produce
                         // the same error again. Fall through to Jamf with rawABM = [].
                     }
@@ -295,14 +399,27 @@ final class SyncEngine: ObservableObject {
                 } else {
                     // ── Option B: cursor resume ──────────────────────────────
                     // Check for a saved cursor from a previous interrupted fetch.
-                    // Only resume if the cursor was saved for the current scope —
-                    // never use an ABM cursor for an ASM fetch or vice versa.
+                    // Resume only if the cursor was saved for the current scope AND the
+                    // current credential identity — an ABM cursor is never used for an
+                    // ASM fetch, and a cursor is never replayed against a different
+                    // clientId (which could point into a different organisation).
                     let currentScopeRaw = store.axmCredentials.scope.rawValue
+                    let currentIdentity = KeychainService.tokenIdentity(
+                        origin:   store.axmCredentials.scope.baseURL,
+                        clientId: store.axmCredentials.clientId)
                     let savedCursor: String? = {
                         guard prefs.axmResumeScope == currentScopeRaw,
                               let c = prefs.axmResumeCursor, !c.isEmpty else { return nil }
+                        // Empty identity == cursor written before this key existed — accept
+                        // it (scope-checked, as the shipping version does).
+                        let savedIdentity = prefs.axmResumeIdentity
+                        guard savedIdentity.isEmpty || savedIdentity == currentIdentity else { return nil }
                         return c
                     }()
+                    if savedCursor == nil, prefs.axmResumeCursor != nil {
+                        log.warn("Step 1/4 — Discarding saved AxM resume cursor: scope or credential identity changed since it was written.")
+                        prefs.clearAxmResumeCursor()
+                    }
                     if savedCursor != nil {
                         log.info("Step 1/4 — Resuming ABM fetch from saved cursor (\(prefs.axmResumedDeviceCount) devices already in cache).")
                         stepLabel = "Resuming AxM fetch from page \(prefs.axmResumedDeviceCount / 1000 + 1)…"
@@ -312,7 +429,7 @@ final class SyncEngine: ObservableObject {
                     // Set to 0 (or remove entirely) before releasing to production.
                     let debugPageLimit = 0   // e.g. 1000 to test resume after 1 page
 
-                    rawABM = await abmService.fetchOrgDevices(
+                    rawABM = try await abmService.fetchOrgDevices(
                         pageSize:       pageSize,
                         resumeCursor:   savedCursor,
                         debugPageLimit: debugPageLimit,
@@ -326,23 +443,37 @@ final class SyncEngine: ObservableObject {
                         },
                         onBatchReady: { [weak self] batch, nextCursor in
                             guard let self else { return }
-                            // Save cursor + device count to UserDefaults immediately.
-                            // This runs on MainActor (onBatchReady is @MainActor).
+                            // S3: durably commit this batch to CoreData BEFORE advancing the
+                            // resume cursor. Merge with no Jamf input (same shape as the
+                            // cache-fresh and Stop-partial merges) so Jamf fields already on
+                            // disk are carried forward, never nil'd. If the save throws the
+                            // cursor is NOT advanced and the error propagates out of
+                            // fetchOrgDevices — the next run replays from the last committed
+                            // batch (re-upserting a saved batch is idempotent by serial).
+                            if !batch.isEmpty {
+                                let existingSnap   = await store.fetchAllDevicesForMerge()
+                                let jamfOriginSnap = store.jamfCredentials.canonicalOrigin
+                                let mergedBatch = await Task.detached(priority: .userInitiated) {
+                                    mergeDevicesOffActor(abm: batch, jamf: [], mobile: [],
+                                                         existing: existingSnap, jamfOrigin: jamfOriginSnap)
+                                }.value.devices
+                                try await store.upsertDevicesDurably(mergedBatch.map { $0.toDevice() })
+                            }
                             if let cursor = nextCursor {
-                                // More pages remaining — save cursor so next run can resume
                                 prefs.axmResumeCursor       = cursor
                                 prefs.axmResumedDeviceCount += batch.count
                                 prefs.axmResumeScope        = currentScopeRaw
-                                self.log.info("Cursor saved: \(batch.count) devices flushed, \(prefs.axmResumedDeviceCount) total, cursor=\(cursor.prefix(20))…")
+                                prefs.axmResumeIdentity     = currentIdentity
+                                self.log.info("Batch committed: \(batch.count) device(s) saved (\(prefs.axmResumedDeviceCount) total), resume cursor advanced to \(cursor.prefix(20))…")
                             } else {
-                                // nil cursor = fetch complete — clear the saved resume state
                                 prefs.clearAxmResumeCursor()
-                                self.log.info("Fetch complete — resume cursor cleared.")
+                                self.log.info("AxM fetch complete — resume cursor cleared.")
                             }
                         }
                     )
-                    // fetchOrgDevices never throws — it returns partial on failure.
-                    // rawABM will be empty only if credentials were bad or fetch never started.
+                    // fetchOrgDevices returns partial on network failure; it throws only
+                    // if a batch failed to commit (handled by _run's catch below).
+                    // rawABM is empty only if credentials were bad or the fetch never started.
                     runAxmCount = rawABM.count
                     if rawABM.isEmpty && savedCursor == nil {
                         log.warn("Step 1/4 — AxM fetch returned 0 devices. Check credentials and network.")
@@ -415,15 +546,19 @@ final class SyncEngine: ObservableObject {
                 } else {
                     log.warn("Step 2/4 — Jamf authentication failed (\(tested.label)). Skipping Jamf fetch.")
                     jamfAuthPassed = false
+                    mark(.partial)   // S7: Jamf side contributed nothing this run
                 }
             }
 
             if !jamfAuthPassed {
                 // warning already logged above — Jamf skipped
-            } else if !forceDevices && prefs.jamfIsFresh && !coreDataEmpty {
+            } else if !forceDevices && !forceJamf && prefs.jamfIsFresh && !coreDataEmpty {
                 log.info("Step 2/4 — Jamf cache fresh (last synced \(prefs.display(prefs.lastJamfSync))), skipping.")
             } else {
                 phase     = .jamf; stepStartTime = Date(); stepElapsed = ""
+                if forceJamf {
+                    log.info("Step 2/4 — Full Jamf re-fetch (connection changed) — rebuilding the serial→Jamf-ID map against the current host.")
+                }
                 log.info("Step 2/4 — Fetching Jamf computers")
 
                 if store.jamfCredentials.url.isEmpty
@@ -450,6 +585,7 @@ final class SyncEngine: ObservableObject {
                     } catch {
                         log.error("Step 2/4 — Jamf computer fetch failed: \(error.localizedDescription). Continuing without computers.")
                         rawJamf = []
+                        mark(.partial)   // S7: Jamf inventory incomplete this run
                     }
                     } else {
                         log.info("Step 2/4 — Jamf computers skipped (Sync Device Types = Mobile Only).")
@@ -474,6 +610,7 @@ final class SyncEngine: ObservableObject {
                     } catch {
                         log.warn("Step 2/4 — Jamf mobile fetch failed: \(error.localizedDescription). Continuing without mobile devices.")
                         rawMobile = []
+                        mark(.partial)   // S7: Jamf inventory incomplete this run
                     }
                     } else {
                         log.info("Step 2/4 — Jamf mobile devices skipped (Sync Device Types = Mac Only).")
@@ -499,8 +636,9 @@ final class SyncEngine: ObservableObject {
                 let abmSnapshot    = rawABM
                 let jamfSnapshot   = rawJamf
                 let mobileSnapshot = rawMobile
+                let jamfOriginSnap = store.jamfCredentials.canonicalOrigin
                 let mergeResult = await Task.detached(priority: .userInitiated) {
-                    mergeDevicesOffActor(abm: abmSnapshot, jamf: jamfSnapshot, mobile: mobileSnapshot, existing: existingSnap)
+                    mergeDevicesOffActor(abm: abmSnapshot, jamf: jamfSnapshot, mobile: mobileSnapshot, existing: existingSnap, jamfOrigin: jamfOriginSnap)
                 }.value
                 let merged = mergeResult.devices
                 if mergeResult.clearedExternally > 0 {
@@ -523,7 +661,7 @@ final class SyncEngine: ObservableObject {
 
                 stepLabel = "Saving \(merged.count) devices to CoreData…"
                 let mdmLookup = mdmServerLookup
-                await store.upsertDevices(merged.map { sd in
+                let mergeSaveOK = await store.upsertDevices(merged.map { sd in
                     var d = sd.toDevice()
                     if let server = mdmLookup[d.serialNumber] {
                         d = d.copying(
@@ -534,6 +672,7 @@ final class SyncEngine: ObservableObject {
                     }
                     return d
                 })
+                if !mergeSaveOK { mark(.partial); log.error("Merge save incomplete — some devices were not written this run.") }
                 // A2: Wait for CoreData reload to complete so Step 3 sees fresh device list
                 await store.loadDevicesFromCoreDataSync()
 
@@ -629,6 +768,7 @@ final class SyncEngine: ObservableObject {
             if axmFetchIncomplete {
                 let fetchedSoFar = store.devices.filter { $0.deviceSource != .jamfOnly && $0.axmDeviceId != nil }.count
                 log.warn("Step 3/4 — AppleCare coverage API skipped: Apple org devices fetch is incomplete — \(fetchedSoFar) devices fetched so far, remaining pages still pending. Re-sync to fetch the remaining devices from Apple. Coverage will run automatically once all pages are complete.")
+                mark(.partial)   // S7: resume cursor still set — not a complete sync
             } else if !axmCredsAvailable {
                 log.warn("Step 3/4 — AxM credentials not configured — skipping coverage fetch.")
             } else if case .failure = store.axmAuthStatus {
@@ -742,7 +882,7 @@ final class SyncEngine: ObservableObject {
                                         // Connection reset or stream error — wait and retry on a
                                         // fresh session (the original taskSession may be broken).
                                         let backoff: UInt64 = 2_000_000_000 // 2s
-                                        await LogService.shared.warn("Coverage [\(globalIdx+1)/\(targets.count)] \(device.serialNumber): URLError \(urlErr.code.rawValue) — retrying with fresh session…")
+                                        await runLog.warn("Coverage [\(globalIdx+1)/\(targets.count)] \(device.serialNumber): URLError \(urlErr.code.rawValue) — retrying with fresh session…")
                                         let retrySession = _makeABMCoverageSession()
                                         try? await Task.sleep(nanoseconds: backoff)
                                         do {
@@ -751,7 +891,7 @@ final class SyncEngine: ObservableObject {
                                                 session: retrySession)
                                             return .success(device, cov, globalIdx)
                                         } catch {
-                                            await LogService.shared.warn("Coverage [\(globalIdx+1)/\(targets.count)] \(device.serialNumber): skipped after URLError retry — \(error.localizedDescription)")
+                                            await runLog.warn("Coverage [\(globalIdx+1)/\(targets.count)] \(device.serialNumber): skipped after URLError retry — \(error.localizedDescription)")
                                             return .skipped(device.serialNumber, globalIdx)
                                         }
                                     } catch {
@@ -776,7 +916,7 @@ final class SyncEngine: ObservableObject {
                                                 return .rateLimited(device, globalIdx)
                                             }
                                         } else {
-                                            await LogService.shared.warn("Coverage [\(globalIdx+1)/\(targets.count)] \(device.serialNumber): skipped — \(error.localizedDescription)")
+                                            await runLog.warn("Coverage [\(globalIdx+1)/\(targets.count)] \(device.serialNumber): skipped — \(error.localizedDescription)")
                                             return .skipped(device.serialNumber, globalIdx)
                                         }
                                     }
@@ -822,6 +962,7 @@ final class SyncEngine: ObservableObject {
                                 log.error("Coverage: auth failed after retry — aborting coverage step.")
                                 if !covBatch.isEmpty { await store.upsertDevices(covBatch); covBatch.removeAll() }
                                 covAborted = true
+                                mark(.partial)   // S7: coverage step ended early on auth failure
                                 break chunkCovLoop
                             }
                         }
@@ -895,6 +1036,10 @@ final class SyncEngine: ObservableObject {
             // only the vendor name (from AxM org API) is not useful.
             let allPending = store.devices.filter {
                 guard $0.wbStatus == .pending && $0.deviceSource != .axmOnly else { return false }
+                // S2: never PATCH by a jamfId whose serial→ID mapping hasn't been
+                // re-confirmed against the currently configured Jamf host. Applies to
+                // manual and scheduled runs alike — both reach Step 4 through here.
+                guard $0.jamfMappingValidated else { return false }
                 // Require at least one coverage field to have been populated.
                 let hasCoverageData = $0.coverageStatus != .notFetched
                 if !hasCoverageData {
@@ -918,6 +1063,7 @@ final class SyncEngine: ObservableObject {
             let totalWithCoverage = store.devices.filter { $0.coverageStatus != .notFetched && $0.deviceSource != .jamfOnly }.count
             let skippedAxmOnly   = store.devices.filter { $0.wbStatus == .pending && $0.deviceSource == .axmOnly }.count
             let skippedNoCov     = store.devices.filter { $0.wbStatus == .pending && $0.coverageStatus == .notFetched && $0.deviceSource != .axmOnly }.count
+            let skippedRevalidate = store.devices.filter { $0.wbStatus == .pending && $0.deviceSource != .axmOnly && !$0.jamfMappingValidated }.count
             let alreadySynced    = store.devices.filter { $0.wbStatus == .synced }.count
             log.info("Step 4/4 — Jamf Update for \(wbTargets.count) device(s)")
             log.info("  Coverage in cache : \(totalWithCoverage) device(s) have AppleCare data")
@@ -930,6 +1076,9 @@ final class SyncEngine: ObservableObject {
             if skippedNoCov > 0 {
                 log.info("  Skipped (no cov)  : \(skippedNoCov) device(s) — coverage not yet fetched")
             }
+            if skippedRevalidate > 0 {
+                log.warn("  Skipped (S2)      : \(skippedRevalidate) device(s) — Jamf mapping pending revalidation against the current host; re-sync to confirm.")
+            }
 
             var wbSynced = 0, wbFailed = 0, wbSkipped = 0
 
@@ -940,7 +1089,7 @@ final class SyncEngine: ObservableObject {
                 currentStep = 0
 
                 // ── Concurrent Jamf PATCH ─────────────────────────────────────
-                // Jamf Pro's PATCH /api/v3/computers-inventory-detail/{id} endpoints
+                // Jamf Pro's PATCH /api/v4/computers-inventory-detail/{id} endpoints
                 // are independent resources — safe to hit concurrently. We cap at
                 // 8 in-flight requests so we don't overwhelm on-premise Jamf servers.
                 // A single OAuth token is fetched once up-front and reused by all tasks.
@@ -1004,6 +1153,7 @@ final class SyncEngine: ObservableObject {
                                             vendor:         vendorStr,
                                             poNumber:       device.axmOrderNumber,
                                             poDate:         device.axmOrderDate,
+                                            mappingValidated: device.jamfMappingValidated,
                                             token:          sharedJamfToken
                                         )
                                     } else {
@@ -1014,6 +1164,7 @@ final class SyncEngine: ObservableObject {
                                             vendor:       vendorStr,
                                             poNumber:     device.axmOrderNumber,
                                             poDate:       device.axmOrderDate,
+                                            mappingValidated: device.jamfMappingValidated,
                                             token:        sharedJamfToken
                                         )
                                     }
@@ -1021,11 +1172,15 @@ final class SyncEngine: ObservableObject {
                                 do {
                                     try await attempt()
                                     return .synced(device)
+                                } catch JamfError.mappingNotValidated {
+                                    // S2 last-line guard fired (SyncEngine's own filter should have
+                                    // caught this first) — a deliberate skip, never a failure.
+                                    return .skipped(device, "Jamf mapping pending revalidation")
                                 } catch let error as NSError where error.code == NSURLErrorCancelled {
                                     // -999 NSURLErrorCancelled: Jamf Cloud's load balancer closed
                                     // a shared keep-alive connection mid-flight. Not an auth failure —
                                     // safe to retry once after a short pause.
-                                    await LogService.shared.debug("WB -999 cancelled for \(device.serialNumber) — retrying after 500ms")
+                                    await runLog.debug("WB -999 cancelled for \(device.serialNumber) — retrying after 500ms")
                                     try await Task.sleep(nanoseconds: 500_000_000)
                                     do {
                                         try await attempt()
@@ -1090,6 +1245,7 @@ final class SyncEngine: ObservableObject {
                         if toRetry.isEmpty {
                             log.error("Jamf Update: auth error — aborting after chunk re-auth failed.")
                             if !wbBatch.isEmpty { await store.upsertDevices(wbBatch); wbBatch.removeAll() }
+                            mark(.partial)   // S7: write-back stopped before all devices patched
                             break chunkLoop
                         }
 
@@ -1108,7 +1264,8 @@ final class SyncEngine: ObservableObject {
                                         appleCareId:    device.axmAgreementNumber,
                                         vendor:         retryVendor,
                                         poNumber:       device.axmOrderNumber,
-                                        poDate:         device.axmOrderDate
+                                        poDate:         device.axmOrderDate,
+                                        mappingValidated: device.jamfMappingValidated
                                     )
                                 } else {
                                     try await jamfService.writeWarrantyBack(
@@ -1117,7 +1274,8 @@ final class SyncEngine: ObservableObject {
                                         appleCareId:  device.axmAgreementNumber,
                                         vendor:       retryVendor,
                                         poNumber:     device.axmOrderNumber,
-                                        poDate:       device.axmOrderDate
+                                        poDate:       device.axmOrderDate,
+                                        mappingValidated: device.jamfMappingValidated
                                     )
                                 }
                                 wbSynced += 1
@@ -1130,6 +1288,7 @@ final class SyncEngine: ObservableObject {
                                 log.error("Jamf Update re-auth retry FAILED \(device.serialNumber) — aborting.")
                                 wbBatch.append(device.withWBStatus(.failed, note: "Auth failed after retry"))
                                 if !wbBatch.isEmpty { await store.upsertDevices(wbBatch); wbBatch.removeAll() }
+                                mark(.partial)   // S7: write-back stopped before all devices patched
                                 break chunkLoop
                             }
                         }
@@ -1204,6 +1363,11 @@ final class SyncEngine: ObservableObject {
             // over-reports when only one source was cached.
             lastRunFromCache = max(0, store.devices.count - runAxmCount - runJamfCount)
 
+            // S7: write-back that lost devices, and any latched save failure, mean
+            // this run is not a clean success — downgrade before it is reported.
+            if runWBFailed > 0 { mark(.partial) }
+            if store.persistenceFailure { mark(.partial) }
+
             // Persist summary to UserDefaults so it survives app relaunch.
             await MainActor.run {
                 store.prefs.lrDateEpoch   = lastRunDate?.timeIntervalSince1970 ?? 0
@@ -1217,21 +1381,38 @@ final class SyncEngine: ObservableObject {
                 store.prefs.lrCovFetched  = lastRunCovFetched
                 store.prefs.lrWBSynced    = lastRunWBSynced
                 store.prefs.lrWBFailed    = lastRunWBFailed
+                store.prefs.lrOutcome     = outcome.rawValue
             }
 
-            phase    = .done
-            tabBadge = ""
-            onSyncStatusChange?(.success, Date())
-            SyncNotificationService.sendCompletion(
-                devices: store.devices.count,
-                coverage: runCoverageCount,
-                writeback: runWBSynced
-            )
+            lastOutcome = outcome
+            phase       = outcome == .failed ? .error : .done
+            tabBadge    = ""
+            onSyncStatusChange?(outcome.environmentStatus, Date())
+            switch outcome {
+            case .success:
+                SyncNotificationService.sendCompletion(
+                    devices: store.devices.count,
+                    coverage: runCoverageCount,
+                    writeback: runWBSynced
+                )
+            case .partial:
+                var bits: [String] = ["\(store.devices.count) devices in cache"]
+                if runWBFailed > 0            { bits.append("\(runWBFailed) write-back(s) failed") }
+                if prefs.axmResumeCursor != nil { bits.append("Apple fetch incomplete") }
+                if store.persistenceFailure  { bits.append("some devices not saved") }
+                SyncNotificationService.sendPartial(detail: bits.joined(separator: " · "))
+            case .failed:
+                SyncNotificationService.sendError(message: lastError ?? "Sync failed.")
+            case .cancelled:
+                break
+            }
             NSApp.dockTile.badgeLabel = nil
 
-            stepLabel = "Sync complete — \(store.devices.count) devices | " +
-                        "coverage: \(store.devices.filter { $0.coverageStatus == .active }.count) active | " +
-                        "Jamf Update: \(wbSynced) synced"
+            stepLabel = outcome == .success
+                ? "Sync complete — \(store.devices.count) devices | " +
+                  "coverage: \(store.devices.filter { $0.coverageStatus == .active }.count) active | " +
+                  "Jamf Update: \(wbSynced) synced"
+                : "\(outcome.label) — \(store.devices.count) devices | Jamf Update: \(wbSynced) synced, \(runWBFailed) failed"
             currentStep = totalSteps
             log.info(stepLabel)
             store.recomputeStats()
@@ -1291,9 +1472,11 @@ final class SyncEngine: ObservableObject {
             log.info("═══════════════════════════════════════════════")
 
         } catch is CancellationError {
-            phase     = .idle
-            stepLabel = "Stopped."
-            onSyncStatusChange?(.error, Date())
+            phase       = .idle
+            stepLabel   = "Stopped."
+            lastOutcome = .cancelled
+            store.prefs.lrOutcome = SyncOutcome.cancelled.rawValue
+            onSyncStatusChange?(.cancelled, Date())
             log.warn("Sync cancelled by user.")
 
             // ── Persist last run summary for stop-sync so UI reflects actual work done ──
@@ -1356,8 +1539,13 @@ final class SyncEngine: ObservableObject {
             if !rawABM.isEmpty || !rawJamf.isEmpty || !rawMobile.isEmpty {
                 log.info("Saving \(rawABM.count) AxM + \(rawJamf.count) Jamf + \(rawMobile.count) mobile partial results before exit…")
                 let existingSnap = await store.fetchAllDevicesForMerge()
+                let jamfOriginSnap = store.jamfCredentials.canonicalOrigin
+                // Snapshot the mutable fetch buffers to immutable locals so the detached
+                // merge closure captures only Sendable values (same shape as the main
+                // and batch merges above).
+                let abmSnap = rawABM, jamfSnap = rawJamf, mobileSnap = rawMobile
                 let partialResult = await Task.detached(priority: .userInitiated) {
-                    mergeDevicesOffActor(abm: rawABM, jamf: rawJamf, mobile: rawMobile, existing: existingSnap)
+                    mergeDevicesOffActor(abm: abmSnap, jamf: jamfSnap, mobile: mobileSnap, existing: existingSnap, jamfOrigin: jamfOriginSnap)
                 }.value
                 let partial = partialResult.devices
                 if partialResult.clearedExternally > 0 {
@@ -1386,15 +1574,9 @@ final class SyncEngine: ObservableObject {
                 log.info("Partial data saved (\(partial.count) devices). Next Run Sync will resume from Step 3.")
             }
         } catch let e as SyncError {
-            phase = .error; lastError = e.localizedDescription
-            stepLabel = "Error: \(e.localizedDescription)"
-            log.error(e.localizedDescription)
-            SyncNotificationService.sendError(message: e.localizedDescription)
+            handleRunError(e.localizedDescription)
         } catch {
-            phase = .error; lastError = error.localizedDescription
-            stepLabel = "Error: \(error.localizedDescription)"
-            log.error(error.localizedDescription)
-            SyncNotificationService.sendError(message: error.localizedDescription)
+            handleRunError(error.localizedDescription)
         }
 
         // End-of-run cleanup — runs regardless of success, error, or cancellation.
@@ -1425,7 +1607,9 @@ private func mergeDevicesOffActor(
         abm:      [RawABMDevice],
         jamf:     [RawJamfComputer],
         mobile:   [RawJamfMobileDevice],
-        existing: [Device]
+        existing: [Device],
+        jamfOrigin: String   // S2: canonical origin of the Jamf host this fetch ran against —
+                             // stamped on every device whose serial is (re-)matched here.
     ) -> (devices: [SyncDevice], clearedExternally: Int) {
 
         let existingBySerial: [String: Device] = Dictionary(
@@ -1459,6 +1643,10 @@ private func mergeDevicesOffActor(
                     axmDeviceStatus:      d.axmDeviceStatus,
                     axmDeviceFetchedAt:   d.axmDeviceFetchedAt,
                     axmPurchaseSource:    d.axmPurchaseSource,
+                    axmPurchaseSourceId:  d.axmPurchaseSourceId,
+                    axmOrderNumber:       d.axmOrderNumber,
+                    axmOrderDate:         d.axmOrderDate,
+                    axmAddedToOrgDate:    d.axmAddedToOrgDate,
                     axmModel:             d.axmModel,
                     axmDeviceModel:       d.axmDeviceModel,
                     axmDeviceClass:       d.axmDeviceClass,
@@ -1481,13 +1669,22 @@ private func mergeDevicesOffActor(
                     jamfReportDate:       d.jamfReportDate,
                     jamfLastContact:      d.jamfLastContact,
                     jamfLastEnrolled:     d.jamfLastEnrolled,
+                    jamfMdmCertExpiration: d.jamfMdmCertExpiration,
+                    jamfInitialEntryDate: d.jamfInitialEntryDate,
+                    jamfProcessorType:    d.jamfProcessorType,
+                    jamfRamGB:            d.jamfRamGB,
                     jamfWarrantyDate:     d.jamfWarrantyDate,
                     jamfVendor:           d.jamfVendor,
                     jamfAppleCareId:      d.jamfAppleCareId,
                     jamfOsVersion:        d.jamfOsVersion,
                     jamfFileVaultStatus:  d.jamfFileVaultStatus,
                     jamfUsername:         d.jamfUsername,
-                    jamfDeviceType:       d.jamfDeviceType
+                    jamfDeviceType:       d.jamfDeviceType,
+                    assignedMdmServerId:  d.assignedMdmServerId,
+                    assignedMdmServerName: d.assignedMdmServerName,
+                    mdmServerType:        d.mdmServerType,
+                    jamfValidationStatus:   d.jamfValidationStatus,
+                    lastValidatedJamfOrigin: d.lastValidatedJamfOrigin
                 )
             }
 
@@ -1521,6 +1718,7 @@ private func mergeDevicesOffActor(
                 axmPurchaseSourceId:  d.purchaseSourceId ?? ex?.axmPurchaseSourceId,
                 axmOrderNumber:       d.orderNumber      ?? ex?.axmOrderNumber,
                 axmOrderDate:         d.orderDate        ?? ex?.axmOrderDate,
+                axmAddedToOrgDate:    d.addedToOrgDate   ?? ex?.axmAddedToOrgDate,
                 axmModel:             d.productDescription ?? ex?.axmModel,
                 axmDeviceModel:       d.deviceModel ?? ex?.axmDeviceModel,
                 axmDeviceClass:       d.deviceClass ?? ex?.axmDeviceClass,
@@ -1559,13 +1757,22 @@ private func mergeDevicesOffActor(
                 jamfReportDate:       ex?.jamfReportDate,
                 jamfLastContact:      ex?.jamfLastContact,
                 jamfLastEnrolled:     ex?.jamfLastEnrolled,
+                jamfMdmCertExpiration: ex?.jamfMdmCertExpiration,
+                jamfInitialEntryDate: ex?.jamfInitialEntryDate,
+                jamfProcessorType:    ex?.jamfProcessorType,
+                jamfRamGB:            ex?.jamfRamGB,
                 jamfWarrantyDate:     ex?.jamfWarrantyDate,
                 jamfVendor:           ex?.jamfVendor,
                 jamfAppleCareId:      ex?.jamfAppleCareId,
                 jamfOsVersion:        ex?.jamfOsVersion,
                 jamfFileVaultStatus:  ex?.jamfFileVaultStatus,
                 jamfUsername:         ex?.jamfUsername,
-                jamfDeviceType:       axmDerivedDeviceType
+                jamfDeviceType:       axmDerivedDeviceType,
+                // S2: the ABM loop never confirms a Jamf mapping — carry the existing
+                // validation state forward untouched. The jamf loop below re-stamps it
+                // to .validated for any serial it actually re-matches against this host.
+                jamfValidationStatus:   ex?.jamfValidationStatus,
+                lastValidatedJamfOrigin: ex?.lastValidatedJamfOrigin
             )
         }
 
@@ -1583,8 +1790,12 @@ private func mergeDevicesOffActor(
                 sd.jamfModelIdentifier = c.modelIdentifier
                 sd.jamfMacAddress      = c.macAddress
                 sd.jamfReportDate      = c.reportDate
-                sd.jamfLastContact     = c.lastContactTime
+                sd.jamfLastContact     = c.lastCheckIn
                 sd.jamfLastEnrolled    = c.enrolledDate
+                sd.jamfMdmCertExpiration = c.mdmCertificateExpiration
+                sd.jamfInitialEntryDate  = c.initialEntryDate
+                sd.jamfProcessorType     = c.processorType
+                sd.jamfRamGB             = c.totalRamMegabytes.map { String($0 / 1024) }
                 sd.jamfWarrantyDate    = c.warrantyDate
                 sd.jamfVendor          = c.vendor
                 sd.jamfAppleCareId     = c.appleCareId
@@ -1595,6 +1806,10 @@ private func mergeDevicesOffActor(
                 // axmProductFamily from ABM takes precedence for isMobile logic,
                 // but jamfDeviceType records where in Jamf this device was found.
                 sd.jamfDeviceType      = "computer"
+                // S2: serial freshly matched against the currently configured Jamf host —
+                // the jamfId now on this record is trustworthy for write-back.
+                sd.jamfValidationStatus    = JamfValidationStatus.validated.rawValue
+                sd.lastValidatedJamfOrigin = jamfOrigin
                 // Reset to .pending on new Jamf match (device gains a jamfId it can now be written to)
                 // or if coverage data changed since last successful sync.
                 // Fix #5: preserve .failed/.skipped status when no new data has arrived —
@@ -1651,6 +1866,7 @@ private func mergeDevicesOffActor(
                     axmPurchaseSourceId:  nil,
                     axmOrderNumber:       nil,
                     axmOrderDate:         nil,
+                    axmAddedToOrgDate:    nil,
                     axmModel:             nil,
                     axmDeviceModel:       nil,
                     axmDeviceClass:       nil,
@@ -1671,15 +1887,22 @@ private func mergeDevicesOffActor(
                     jamfModelIdentifier:  c.modelIdentifier,
                     jamfMacAddress:       c.macAddress,
                     jamfReportDate:       c.reportDate,
-                    jamfLastContact:      c.lastContactTime,
+                    jamfLastContact:      c.lastCheckIn,
                     jamfLastEnrolled:     c.enrolledDate,
+                    jamfMdmCertExpiration: c.mdmCertificateExpiration,
+                    jamfInitialEntryDate: c.initialEntryDate,
+                    jamfProcessorType:    c.processorType,
+                    jamfRamGB:            c.totalRamMegabytes.map { String($0 / 1024) },
                     jamfWarrantyDate:     c.warrantyDate,
                     jamfVendor:           c.vendor,
                     jamfAppleCareId:      c.appleCareId,
                     jamfOsVersion:        c.osVersion,
                     jamfFileVaultStatus:  c.fileVault2Status,
                     jamfUsername:         c.username,
-                    jamfDeviceType:       "computer"
+                    jamfDeviceType:       "computer",
+                    // S2: record seen on the currently configured Jamf host this run.
+                    jamfValidationStatus:   JamfValidationStatus.validated.rawValue,
+                    lastValidatedJamfOrigin: jamfOrigin
                 )
             }
         }
@@ -1709,6 +1932,13 @@ private func mergeDevicesOffActor(
                 sd.jamfFileVaultStatus = nil    // not applicable for mobile
                 sd.jamfUsername        = m.username
                 sd.jamfDeviceType      = "mobile"
+                sd.jamfMdmCertExpiration = nil  // not applicable for mobile
+                sd.jamfInitialEntryDate  = nil  // not applicable for mobile
+                sd.jamfProcessorType     = nil  // not applicable for mobile
+                sd.jamfRamGB             = nil  // not applicable for mobile
+                // S2: serial freshly matched against the currently configured Jamf host.
+                sd.jamfValidationStatus    = JamfValidationStatus.validated.rawValue
+                sd.lastValidatedJamfOrigin = jamfOrigin
 
                 let isNewJamfMatch = existingBySerial[m.serialNumber]?.deviceSource == .axmOnly
                     || existingBySerial[m.serialNumber] == nil
@@ -1754,6 +1984,7 @@ private func mergeDevicesOffActor(
                     axmPurchaseSourceId:  nil,
                     axmOrderNumber:       nil,
                     axmOrderDate:         nil,
+                    axmAddedToOrgDate:    nil,
                     axmModel:             nil,
                     axmDeviceModel:       nil,
                     axmDeviceClass:       nil,
@@ -1776,13 +2007,20 @@ private func mergeDevicesOffActor(
                     jamfReportDate:       m.lastInventoryUpdate,
                     jamfLastContact:      m.lastInventoryUpdate,
                     jamfLastEnrolled:     m.lastEnrolledDate,
+                    jamfMdmCertExpiration: nil,   // not applicable for mobile
+                    jamfInitialEntryDate: nil,    // not applicable for mobile
+                    jamfProcessorType:    nil,    // not applicable for mobile
+                    jamfRamGB:            nil,    // not applicable for mobile
                     jamfWarrantyDate:     m.warrantyDate,
                     jamfVendor:           m.vendor,
                     jamfAppleCareId:      m.appleCareId,
                     jamfOsVersion:        m.osVersion,
                     jamfFileVaultStatus:  nil,
                     jamfUsername:         m.username,
-                    jamfDeviceType:       "mobile"
+                    jamfDeviceType:       "mobile",
+                    // S2: record seen on the currently configured Jamf host this run.
+                    jamfValidationStatus:   JamfValidationStatus.validated.rawValue,
+                    lastValidatedJamfOrigin: jamfOrigin
                 )
             }
         }
@@ -1816,6 +2054,7 @@ private struct SyncDevice {
     var axmPurchaseSourceId:  String?
     var axmOrderNumber:       String?
     var axmOrderDate:         String?
+    var axmAddedToOrgDate:    String?
     var axmModel:             String?
     var axmDeviceModel:       String?
     var axmDeviceClass:       String?
@@ -1838,6 +2077,10 @@ private struct SyncDevice {
     var jamfReportDate:       String?
     var jamfLastContact:      String?
     var jamfLastEnrolled:     String?
+    var jamfMdmCertExpiration: String?   // general.mdmCertificateExpiration (date-time)
+    var jamfInitialEntryDate: String?    // general.initialEntryDate — "Enrolled Date" in UI; first-added-to-Jamf date
+    var jamfProcessorType:    String?    // hardware.processorType
+    var jamfRamGB:            String?    // hardware.totalRamMegabytes, converted to whole GB
     var jamfWarrantyDate:     String?
     var jamfVendor:           String?
     var jamfAppleCareId:      String?
@@ -1848,6 +2091,8 @@ private struct SyncDevice {
     var assignedMdmServerId:  String?
     var assignedMdmServerName: String?
     var mdmServerType:        String?
+    var jamfValidationStatus:   String?   // S2: JamfValidationStatus raw
+    var lastValidatedJamfOrigin: String?  // S2: canonical Jamf origin the jamfId mapping was confirmed against
 
     func toDevice() -> Device {
         Device(
@@ -1860,6 +2105,7 @@ private struct SyncDevice {
             axmPurchaseSourceId:  axmPurchaseSourceId,
             axmOrderNumber:       axmOrderNumber,
             axmOrderDate:         axmOrderDate,
+            axmAddedToOrgDate:    axmAddedToOrgDate,
             axmModel:             axmModel,
             axmDeviceModel:       axmDeviceModel,
             axmDeviceClass:       axmDeviceClass,
@@ -1880,6 +2126,10 @@ private struct SyncDevice {
             jamfReportDate:       jamfReportDate,
             jamfLastContact:      jamfLastContact,
             jamfLastEnrolled:     jamfLastEnrolled,
+            jamfMdmCertExpiration: jamfMdmCertExpiration,
+            jamfInitialEntryDate: jamfInitialEntryDate,
+            jamfProcessorType:    jamfProcessorType,
+            jamfRamGB:            jamfRamGB,
             jamfWarrantyDate:     jamfWarrantyDate,
             jamfVendor:           jamfVendor,
             jamfAppleCareId:      jamfAppleCareId,
@@ -1890,6 +2140,8 @@ private struct SyncDevice {
             assignedMdmServerId:  assignedMdmServerId,
             assignedMdmServerName: assignedMdmServerName,
             mdmServerType:        mdmServerType,
+            jamfValidationStatus:   jamfValidationStatus,
+            lastValidatedJamfOrigin: lastValidatedJamfOrigin,
             axmRawJson:           axmRawJson,
             axmCoverageRawJson:   axmCoverageRawJson
         )
@@ -1899,7 +2151,8 @@ private struct SyncDevice {
 // DeviceCoverage is defined in ABMService.swift
 
 // MARK: - Shared formatters (avoid repeated allocations at 60k scale)
-private let _iso8601 = ISO8601DateFormatter()
+// ISO8601DateFormatter is not Sendable-audited — nonisolated(unsafe), read-only.
+nonisolated(unsafe) private let _iso8601 = ISO8601DateFormatter()
 
 // MARK: - Device helpers
 

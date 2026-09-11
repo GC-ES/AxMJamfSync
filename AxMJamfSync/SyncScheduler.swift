@@ -183,20 +183,33 @@ final class SyncScheduler: ObservableObject {
     os_log(.default, "[SyncScheduler] Scheduled sync firing for %{public}d environment(s).", ids.count)
     let names = environmentStore.environments.map(\.name)
     SyncNotificationService.sendScheduleTriggered(environmentNames: names)
+    let runStartedAt = Date()
     environmentStore.enqueueMultiSync(ids: ids)
-    observeQueueCompletion(environmentStore, environmentCount: ids.count)
+    observeQueueCompletion(environmentStore, enqueued: ids, runStartedAt: runStartedAt)
   }
 
-  private func observeQueueCompletion(_ environmentStore: EnvironmentStore, environmentCount: Int) {
+  private func observeQueueCompletion(_ environmentStore: EnvironmentStore,
+                                     enqueued ids: [UUID], runStartedAt: Date) {
     queueCompletionCancellable?.cancel()
+    let startEpoch = runStartedAt.timeIntervalSince1970
     queueCompletionCancellable = environmentStore.$syncQueue
       .dropFirst() // skip the just-enqueued snapshot; wait for a later, empty one
       .filter(\.isEmpty)
       .first()
       .sink { [weak self] _ in
         Task { @MainActor in
-          SyncNotificationService.sendScheduleCompleted(environmentCount: environmentCount)
-          self?.queueCompletionCancellable = nil
+          guard let self, let store = self.environmentStore else { return }
+          // S7: report what actually happened per environment, not just that the
+          // queue drained. An environment with no fresh outcome this run (never
+          // reached, or still stuck) counts as a failure.
+          let outcomes: [SyncOutcome] = ids.map { id in
+            guard let env = store.environments.first(where: { $0.id == id }),
+                  let synced = env.lastSyncedAt,
+                  synced.timeIntervalSince1970 >= startEpoch else { return .failed }
+            return store.lastOutcomeByEnv[id] ?? .failed
+          }
+          SyncNotificationService.sendScheduleCompleted(summary: ScheduledRunSummary(outcomes: outcomes))
+          self.queueCompletionCancellable = nil
         }
       }
   }

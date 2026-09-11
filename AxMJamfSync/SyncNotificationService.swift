@@ -8,6 +8,7 @@ import UserNotifications
 import AppKit
 import os
 
+@MainActor
 enum SyncNotificationService {
 
     // MARK: - Schedule triggered
@@ -28,22 +29,18 @@ enum SyncNotificationService {
     // Fired once when every environment in a scheduled run has finished — a
     // summary on top of the per-environment completion/error notifications
     // below, which still fire individually as the queue works through them.
-    static func sendScheduleCompleted(environmentCount: Int) {
+    static func sendScheduleCompleted(summary: ScheduledRunSummary) {
         let content = UNMutableNotificationContent()
-        content.title = "Scheduled Sync Complete"
-        content.body  = environmentCount == 1
-            ? "Finished syncing 1 environment."
-            : "Finished syncing \(environmentCount) environments."
+        content.title = summary.allClean ? "Scheduled Sync Complete"
+                                         : "Scheduled Sync — Completed with Issues"
+        content.body  = summary.notificationText
         content.sound = .default
         sendNotification(content, id: "schedule-completed")
     }
 
     // MARK: - Completion (success)
     static func sendCompletion(devices: Int, coverage: Int, writeback: Int) {
-        // Bounce dock icon once
-        DispatchQueue.main.async {
-            NSApp.requestUserAttention(.informationalRequest)
-        }
+        NSApp.requestUserAttention(.informationalRequest)   // bounce dock icon once
 
         let content = UNMutableNotificationContent()
         content.title = "AxM Sync Complete ✓"
@@ -52,12 +49,21 @@ enum SyncNotificationService {
         sendNotification(content, id: "sync-complete")
     }
 
+    // MARK: - Partial (S7)
+    // A run that landed real data but did not fully complete — distinct from both a
+    // clean success and an outright failure.
+    static func sendPartial(detail: String) {
+        NSApp.requestUserAttention(.informationalRequest)
+        let content = UNMutableNotificationContent()
+        content.title = "AxM Sync — Completed with Issues"
+        content.body  = detail
+        content.sound = .default
+        sendNotification(content, id: "sync-partial")
+    }
+
     // MARK: - Failure
     static func sendError(message: String) {
-        // Critical bounce — dock icon bounces until user focuses app
-        DispatchQueue.main.async {
-            NSApp.requestUserAttention(.criticalRequest)
-        }
+        NSApp.requestUserAttention(.criticalRequest)   // dock bounces until user focuses app
 
         let content = UNMutableNotificationContent()
         content.title = "AxM Sync Failed ✗"

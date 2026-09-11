@@ -22,6 +22,8 @@ final class AppStore: ObservableObject {
     // MARK: - Dependencies
     let persistence:   PersistenceController
     let prefs:         AppPreferences
+    // S9: per-environment log (shared singleton only for the non-environment placeholder).
+    let log:           LogService
     /// Non-nil when running in multi-environment mode (v2.0+).
     let environmentId: UUID?
 
@@ -41,8 +43,23 @@ final class AppStore: ObservableObject {
     @Published var stats:           DashboardStats  = DashboardStats()
     @Published var hasData:         Bool            = false  // false after wipeCache / before first sync
 
+    /// S7: set true by `upsertDevices` the moment any Core Data save fails, and left
+    /// true until `resetPersistenceFailureFlag()` clears it at the start of the next
+    /// run. SyncEngine reads it at the end of a run so a swallowed save failure can
+    /// never let the run report `.success`.
+    @Published private(set) var persistenceFailure: Bool = false
+    func resetPersistenceFailureFlag() { persistenceFailure = false }
+
+    /// S7: false when this environment's Core Data store failed to load. SyncEngine
+    /// refuses to start a run against an unavailable store.
+    var isStoreReady: Bool { persistence.isStoreReady }
+
     /// Sentinel value used in mdmServerFilter to filter AxM devices with no MDM assignment.
     nonisolated static let mdmUnassignedSentinel = "__unassigned__"
+    /// Sentinel value used in mdmServerFilter to filter AxM devices assigned to ANY MDM
+    /// server — used by the Dashboard's "Assigned" drill-down, which has no single server
+    /// name to match against.
+    nonisolated static let mdmAssignedSentinel   = "__assigned__"
 
     /// Sorted unique MDM server names present in the current device list — drives the filter dropdown.
     var allMdmServerNames: [String] {
@@ -66,8 +83,109 @@ final class AppStore: ObservableObject {
     @Published var mdmServerFilter:    String?         = nil { didSet { scheduleFilter() } }  // assignedMdmServerName
     @Published var deviceSearchText:   String          = "" { didSet { scheduleFilter() } }
 
+    // MARK: - Dashboard drill-down filter state
+    // These don't have their own dropdown in the Devices tab's filter bar (see
+    // DevicesView's dashboardDrillDownDescription) — they exist purely so a tap on a
+    // Dashboard data point can land on a pre-filtered Devices list. Each is matched
+    // against the exact same per-device classification recomputeStats() uses (see the
+    // static helpers below), so a drill-down always shows precisely the devices that
+    // were counted in the number that was tapped.
+    @Published var axmStatusFilter:        String?  = nil { didSet { scheduleFilter() } }  // raw axmDeviceStatus, e.g. "ACTIVE"/"RELEASED"
+    @Published var productFamilyFilter:    String?  = nil { didSet { scheduleFilter() } }  // AppStore.productFamilyLabel(for:)
+    @Published var purchaseSourceFilter:   String?  = nil { didSet { scheduleFilter() } }  // AppStore.purchaseSourceLabel(for:)
+    @Published var addedToOrgYearFilter:   String?  = nil { didSet { scheduleFilter() } }  // AppStore.addedToOrgYearLabel(for:)
+    @Published var jamfManagedFilter:      Bool?    = nil { didSet { scheduleFilter() } }
+    @Published var osVersionFilter:        String?  = nil { didSet { scheduleFilter() } }  // AppStore.osMajorVersionLabel(for:) — pair with deviceTypeFilter to pick Mac vs Mobile
+    @Published var fileVaultFilter:        String?  = nil { didSet { scheduleFilter() } }  // AppStore.fileVaultLabel(for:)
+    @Published var checkinFreshnessFilter: String?  = nil { didSet { scheduleFilter() } }  // AppStore.checkinBucketLabel(for:)
+    @Published var expiringWindowFilter:   String?  = nil { didSet { scheduleFilter() } }  // AppStore.expiringWindowLabel(for:)
+
+    /// Resets every device-list filter, old and new — used by "Clear all filters" in
+    /// DevicesView and by wipeCache().
+    func clearDeviceFilters() {
+        deviceSourceFilter    = nil
+        coverageFilter        = nil
+        wbFilter              = nil
+        deviceTypeFilter      = nil
+        mdmServerFilter       = nil
+        deviceSearchText      = ""
+        axmStatusFilter       = nil
+        productFamilyFilter   = nil
+        purchaseSourceFilter  = nil
+        addedToOrgYearFilter  = nil
+        jamfManagedFilter     = nil
+        osVersionFilter       = nil
+        fileVaultFilter       = nil
+        checkinFreshnessFilter = nil
+        expiringWindowFilter  = nil
+    }
+
+    /// Human-readable description of the Dashboard drill-down filters specifically —
+    /// the ones that don't have their own dropdown in the Devices tab's filter bar (see
+    /// DevicesView), so a chip banner is the only way to show the user why the list
+    /// looks the way it does after a Dashboard tap. Filters that DO have a dropdown
+    /// (source, coverage, write-back, type, MDM server) show their own state in that
+    /// dropdown already, so they're not repeated here.
+    var dashboardDrillDownDescription: String? {
+        if let v = axmStatusFilter       { return "AxM Status: \(v.capitalized)" }
+        if let v = productFamilyFilter   { return "Product Family: \(v)" }
+        if let v = purchaseSourceFilter  { return "Purchase Source: \(v)" }
+        if let v = addedToOrgYearFilter  { return "Added to Org: \(v)" }
+        if let v = jamfManagedFilter     { return v ? "Jamf: Managed" : "Jamf: Unmanaged" }
+        if let v = osVersionFilter       { return "OS Version: \(v)" }
+        if let v = fileVaultFilter       { return "FileVault: \(v)" }
+        if let v = checkinFreshnessFilter { return "Check-in: \(v)" }
+        if let v = expiringWindowFilter  { return "Expiring: \(v) days" }
+        return nil
+    }
+
+    /// Clears only the Dashboard drill-down filters (see dashboardDrillDownDescription),
+    /// leaving the Devices tab's own dropdown filters untouched.
+    func clearDrillDownFilters() {
+        axmStatusFilter        = nil
+        productFamilyFilter    = nil
+        purchaseSourceFilter   = nil
+        addedToOrgYearFilter   = nil
+        jamfManagedFilter      = nil
+        osVersionFilter        = nil
+        fileVaultFilter        = nil
+        checkinFreshnessFilter = nil
+        expiringWindowFilter   = nil
+    }
+
+    /// Convenience for Dashboard drill-down taps: clears every existing filter first,
+    /// then applies only the dimension(s) passed in — so a tap always lands on exactly
+    /// the devices it counted, with no leftover filter from wherever the person was
+    /// before. Pass only the parameter(s) relevant to the tapped element.
+    func drillDown(source: DeviceSource? = nil, coverage: CoverageStatus? = nil, wb: WBStatus? = nil,
+                   deviceType: DeviceKind? = nil, mdmServer: String? = nil,
+                   axmStatus: String? = nil, productFamily: String? = nil, purchaseSource: String? = nil,
+                   addedToOrgYear: String? = nil, jamfManaged: Bool? = nil, osVersion: String? = nil,
+                   fileVault: String? = nil, checkin: String? = nil, expiringWindow: String? = nil) {
+        clearDeviceFilters()
+        deviceSourceFilter     = source
+        coverageFilter         = coverage
+        wbFilter               = wb
+        deviceTypeFilter       = deviceType
+        mdmServerFilter        = mdmServer
+        axmStatusFilter        = axmStatus
+        productFamilyFilter    = productFamily
+        purchaseSourceFilter   = purchaseSource
+        addedToOrgYearFilter   = addedToOrgYear
+        jamfManagedFilter      = jamfManaged
+        osVersionFilter        = osVersion
+        fileVaultFilter        = fileVault
+        checkinFreshnessFilter = checkin
+        expiringWindowFilter   = expiringWindow
+    }
+
     // MARK: - Export
     @Published var exportColumns: [ExportColumn] = []
+
+    /// S2: invoked by saveJamfCredentials() when the Jamf URL/clientId change invalidates
+    /// the cached serial→Jamf-ID mapping. Wired by EnvironmentStore.buildServices() to
+    /// queue a full Jamf inventory re-fetch. nil in the placeholder / v1 store.
+    var onJamfRebindingDetected: (() -> Void)?
 
     // MARK: - Private
     private var filterTask: Task<Void, Never>?
@@ -83,6 +201,7 @@ final class AppStore: ObservableObject {
         self.persistence   = persistence
         self.prefs         = prefs ?? AppPreferences()
         self.environmentId = nil
+        self.log           = .shared
         self.axmCredentials  = KeychainService.loadAxMCredentials()
         self.jamfCredentials = KeychainService.loadJamfCredentials()
 
@@ -157,9 +276,19 @@ final class AppStore: ObservableObject {
         self.persistence   = persistence
         self.prefs         = prefs
         self.environmentId = environment.id
+        self.log           = LogService.makeForEnvironment(id: environment.id)
 
         self.axmCredentials  = KeychainService.loadAxMCredentialsForEnv(id: environment.id, scope: environment.scope)
         self.jamfCredentials = KeychainService.loadJamfCredentialsForEnv(id: environment.id)
+
+        // S2: seed the validated-origin baseline from whatever Jamf host is currently
+        // configured. Pre-fix behaviour trusted the cached serial→Jamf-ID map
+        // unconditionally, so on first run after upgrade the existing mapping is
+        // considered validated against the current host — a later URL/clientId change
+        // is what trips revalidation, not the upgrade itself.
+        if prefs.jamfValidatedOrigin.isEmpty, !jamfCredentials.url.isEmpty {
+            prefs.jamfValidatedOrigin = jamfCredentials.canonicalOrigin
+        }
 
         let saved = prefs.loadExportColumnEnabled()
         exportColumns = ExportColumn.defaultColumns.map { col in
@@ -207,7 +336,7 @@ final class AppStore: ObservableObject {
                 self.devices = mapped
                 self.hasData = !mapped.isEmpty
                 self.cacheIsPopulated = self.hasData
-                LogService.shared.debug("CoreData: loaded \(mapped.count) devices.")
+                log.debug("CoreData: loaded \(mapped.count) devices.")
             }
             recomputeStats()  // recomputeStats calls applyFilterNow internally
         }
@@ -240,6 +369,46 @@ final class AppStore: ObservableObject {
 
     /// Inline (synchronous) filter application — used only from loadDevicesFromCoreDataSync()
     /// so mid-sync batch flushes immediately update filteredDevices on the main thread.
+    // Drill-down filters only — factored out so applyFilterNowSync and applyFilterNow
+    // (which otherwise duplicate their whole predicate) can't drift out of sync on
+    // these newer checks. Each guard mirrors the exact same deviceSource scoping
+    // recomputeStats() uses for that field, so a drill-down always shows precisely
+    // the devices the tapped number was counting.
+    private nonisolated static func matchesDrillDownFilters(_ d: Device,
+        axmStatus: String?, productFamily: String?, purchaseSource: String?,
+        addedToOrgYear: String?, jamfManaged: Bool?, osVersion: String?,
+        fileVault: String?, checkin: String?, expiringWindow: String?
+    ) -> Bool {
+        if let st = axmStatus {
+            guard d.deviceSource != .jamfOnly, (d.axmDeviceStatus?.uppercased() ?? "") == st else { return false }
+        }
+        if let pf = productFamily {
+            guard d.deviceSource != .jamfOnly, Self.productFamilyLabel(for: d) == pf else { return false }
+        }
+        if let ps = purchaseSource {
+            guard d.deviceSource != .jamfOnly, Self.purchaseSourceLabel(for: d) == ps else { return false }
+        }
+        if let yr = addedToOrgYear {
+            guard d.deviceSource != .jamfOnly, Self.addedToOrgYearLabel(for: d) == yr else { return false }
+        }
+        if let jm = jamfManaged {
+            guard d.deviceSource != .axmOnly, d.isManaged == jm else { return false }
+        }
+        if let ov = osVersion {
+            guard d.deviceSource != .axmOnly, Self.osMajorVersionLabel(for: d) == ov else { return false }
+        }
+        if let fv = fileVault {
+            guard d.deviceSource != .axmOnly, d.jamfDeviceType == "computer", Self.fileVaultLabel(for: d) == fv else { return false }
+        }
+        if let ck = checkin {
+            guard d.deviceSource != .axmOnly, Self.checkinBucketLabel(for: d) == ck else { return false }
+        }
+        if let ew = expiringWindow {
+            guard d.deviceSource != .jamfOnly, Self.expiringWindowLabel(for: d) == ew else { return false }
+        }
+        return true
+    }
+
     private func applyFilterNowSync() {
         let snapshot   = devices
         let srcFilter  = deviceSourceFilter
@@ -248,9 +417,20 @@ final class AppStore: ObservableObject {
         let typeFilter = deviceTypeFilter
         let mdmFilter  = mdmServerFilter
         let searchText = deviceSearchText.lowercased()
+        let axmStatusF = axmStatusFilter
+        let familyF    = productFamilyFilter
+        let purchaseF  = purchaseSourceFilter
+        let yearF      = addedToOrgYearFilter
+        let managedF   = jamfManagedFilter
+        let osVerF     = osVersionFilter
+        let fvF        = fileVaultFilter
+        let checkinF   = checkinFreshnessFilter
+        let expiringF  = expiringWindowFilter
+        let noDrillDown = axmStatusF == nil && familyF == nil && purchaseF == nil && yearF == nil
+                       && managedF == nil && osVerF == nil && fvF == nil && checkinF == nil && expiringF == nil
 
         let result: [Device]
-        if srcFilter == nil && covFilter == nil && wbF == nil && typeFilter == nil && mdmFilter == nil && searchText.isEmpty {
+        if srcFilter == nil && covFilter == nil && wbF == nil && typeFilter == nil && mdmFilter == nil && searchText.isEmpty && noDrillDown {
             result = snapshot
         } else {
             result = snapshot.filter { d in
@@ -260,6 +440,8 @@ final class AppStore: ObservableObject {
                 if let mdm = mdmFilter {
                     if mdm == AppStore.mdmUnassignedSentinel {
                         if d.axmAssignmentStatus != "Unassigned" { return false }
+                    } else if mdm == AppStore.mdmAssignedSentinel {
+                        if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
                     } else {
                         if d.assignedMdmServerName != mdm { return false }
                     }
@@ -276,6 +458,10 @@ final class AppStore: ObservableObject {
                        !name.contains(searchText)   &&
                        !model.contains(searchText)  { return false }
                 }
+                if !noDrillDown, !Self.matchesDrillDownFilters(d,
+                    axmStatus: axmStatusF, productFamily: familyF, purchaseSource: purchaseF,
+                    addedToOrgYear: yearF, jamfManaged: managedF, osVersion: osVerF,
+                    fileVault: fvF, checkin: checkinF, expiringWindow: expiringF) { return false }
                 return true
             }
         }
@@ -284,7 +470,46 @@ final class AppStore: ObservableObject {
     }
 
     // MARK: - CoreData upsert (background context, chunked batch — O(n) at 60k scale)
-    func upsertDevices(_ incoming: [Device]) async {
+    /// S7: returns whether every chunk actually persisted. A `false` return also
+    /// latches `persistenceFailure` so a caller that ignores the result still can't
+    /// report a clean run. All chunks are still attempted on partial failure —
+    /// devices that DID save are kept (preserve partial progress).
+    @discardableResult
+    func upsertDevices(_ incoming: [Device]) async -> Bool {
+        guard !incoming.isEmpty else { return true }
+        let ctx = persistence.newBackgroundContext()
+        let chunkSize = 1_000
+        let chunks = stride(from: 0, to: incoming.count, by: chunkSize).map {
+            Array(incoming[$0 ..< min($0 + chunkSize, incoming.count)])
+        }
+        var failedChunks = 0
+        for chunk in chunks {
+            let ok: Bool = await ctx.perform {
+                CDDevice.batchUpsert(devices: chunk, in: ctx)
+                return self.persistence.save(ctx)
+            }
+            if !ok { failedChunks += 1 }
+        }
+        if failedChunks > 0 { persistenceFailure = true }
+        // Force viewContext to merge the saved changes immediately.
+        // automaticallyMergesChangesFromParent fires asynchronously via notification;
+        // refreshAllObjects() makes it synchronous so loadDevicesFromCoreDataSync()
+        // (called right after upsertDevices by SyncEngine) reads fresh data.
+        persistence.viewContext.refreshAllObjects()
+        if failedChunks > 0 {
+            log.error("CoreData: \(failedChunks) of \(chunks.count) chunk(s) FAILED to save (\(incoming.count) device(s) attempted).")
+        } else {
+            log.debug("CoreData: upserted \(incoming.count) device(s) in \(chunks.count) chunk(s).")
+        }
+        loadDevicesFromCoreData()  // throttled — only fires when suppressAutoReload=false
+        return failedChunks == 0
+    }
+
+    /// S3: like `upsertDevices` but propagates a Core Data save failure instead of
+    /// logging and swallowing it. The resume-cursor checkpoint is advanced by the
+    /// caller only after this returns without throwing, so a failed batch commit can
+    /// never leave the cursor ahead of the devices actually on disk.
+    func upsertDevicesDurably(_ incoming: [Device]) async throws {
         guard !incoming.isEmpty else { return }
         let ctx = persistence.newBackgroundContext()
         let chunkSize = 1_000
@@ -292,18 +517,14 @@ final class AppStore: ObservableObject {
             Array(incoming[$0 ..< min($0 + chunkSize, incoming.count)])
         }
         for chunk in chunks {
-            await ctx.perform {
+            try await ctx.perform {
                 CDDevice.batchUpsert(devices: chunk, in: ctx)
-                self.persistence.save(ctx)
+                try self.persistence.saveOrThrow(ctx)
             }
         }
-        // Force viewContext to merge the saved changes immediately.
-        // automaticallyMergesChangesFromParent fires asynchronously via notification;
-        // refreshAllObjects() makes it synchronous so loadDevicesFromCoreDataSync()
-        // (called right after upsertDevices by SyncEngine) reads fresh data.
         persistence.viewContext.refreshAllObjects()
-        LogService.shared.debug("CoreData: upserted \(incoming.count) device(s) in \(chunks.count) chunk(s).")
-        loadDevicesFromCoreData()  // throttled — only fires when suppressAutoReload=false
+        log.debug("CoreData: durably upserted \(incoming.count) device(s) in \(chunks.count) chunk(s).")
+        loadDevicesFromCoreData()
     }
 
     /// Direct CoreData fetch for the sync merge step.
@@ -338,16 +559,11 @@ final class AppStore: ObservableObject {
         devices            = []
         stats              = DashboardStats()
         filteredDevices    = []
-        deviceSourceFilter = nil
-        coverageFilter     = nil
-        wbFilter           = nil
-        deviceTypeFilter   = nil
-        mdmServerFilter    = nil
-        deviceSearchText   = ""
+        clearDeviceFilters()
         // Reset auth so Sync tab becomes disabled (user must re-test auth to re-enable)
         axmAuthStatus      = .idle
         jamfAuthStatus     = .idle
-        LogService.shared.info("Cache reset: CoreData wiped, timestamps cleared.")
+        log.info("Cache reset: CoreData wiped, timestamps cleared.")
     }
 
     // MARK: - Filtering (debounced 200ms, runs off main thread)
@@ -369,10 +585,21 @@ final class AppStore: ObservableObject {
         let typeFilter = deviceTypeFilter
         let mdmFilter  = mdmServerFilter
         let searchText = deviceSearchText.lowercased()
+        let axmStatusF = axmStatusFilter
+        let familyF    = productFamilyFilter
+        let purchaseF  = purchaseSourceFilter
+        let yearF      = addedToOrgYearFilter
+        let managedF   = jamfManagedFilter
+        let osVerF     = osVersionFilter
+        let fvF        = fileVaultFilter
+        let checkinF   = checkinFreshnessFilter
+        let expiringF  = expiringWindowFilter
+        let noDrillDown = axmStatusF == nil && familyF == nil && purchaseF == nil && yearF == nil
+                       && managedF == nil && osVerF == nil && fvF == nil && checkinF == nil && expiringF == nil
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let result: [Device]
-            if srcFilter == nil && covFilter == nil && wbF == nil && typeFilter == nil && mdmFilter == nil && searchText.isEmpty {
+            if srcFilter == nil && covFilter == nil && wbF == nil && typeFilter == nil && mdmFilter == nil && searchText.isEmpty && noDrillDown {
                 result = snapshot
             } else {
                 result = snapshot.filter { d in
@@ -382,6 +609,8 @@ final class AppStore: ObservableObject {
                     if let mdm = mdmFilter {
                         if mdm == AppStore.mdmUnassignedSentinel {
                             if d.axmAssignmentStatus != "Unassigned" { return false }
+                        } else if mdm == AppStore.mdmAssignedSentinel {
+                            if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
                         } else {
                             if d.assignedMdmServerName != mdm { return false }
                         }
@@ -398,6 +627,10 @@ final class AppStore: ObservableObject {
                            !name.contains(searchText)   &&
                            !model.contains(searchText)  { return false }
                     }
+                    if !noDrillDown, !AppStore.matchesDrillDownFilters(d,
+                        axmStatus: axmStatusF, productFamily: familyF, purchaseSource: purchaseF,
+                        addedToOrgYear: yearF, jamfManaged: managedF, osVersion: osVerF,
+                        fileVault: fvF, checkin: checkinF, expiringWindow: expiringF) { return false }
                     return true
                 }
             }
@@ -414,7 +647,98 @@ final class AppStore: ObservableObject {
     }
 
     // MARK: - Stats (single O(n) pass — no redundant .filter calls)
-    func recomputeStats() {
+    // MARK: - ISO date parsing for Dashboard check-in freshness
+    // Static formatters — allocated once, not per-device, per-recompute pass.
+    // nonisolated(unsafe): ISO8601DateFormatter isn't Sendable-audited by Apple yet,
+    // but these are create-once-at-launch and only ever read (date parsing) from
+    // multiple contexts afterward — never mutated post-init — so the manual opt-out
+    // is safe. Needed so checkinBucketLabel/parseISO stay callable from the
+    // nonisolated static classification helpers used inside applyFilterNow()'s
+    // detached Task (see the standing AppStore invariant on that).
+    private nonisolated(unsafe) static let isoFrac: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private nonisolated(unsafe) static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private nonisolated static func parseISO(_ s: String) -> Date? {
+        isoFrac.date(from: s) ?? isoPlain.date(from: s)
+    }
+    // axmCoverageEndDate is a plain "yyyy-MM-dd" string (not ISO8601 with a time
+    // component), so it needs its own formatter — POSIX locale/UTC so parsing
+    // never depends on the user's system calendar or region settings.
+    private nonisolated static let ymdParser: DateFormatter = {
+        let f = DateFormatter()
+        f.locale   = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    // MARK: - Shared per-device classification helpers
+    // Used by BOTH recomputeStats() (to compute the numbers shown) and the filter
+    // predicates in applyFilterNow/applyFilterNowSync (to drive Dashboard drill-down
+    // taps) — factored out so a drill-down can never show a different set of devices
+    // than the number that was tapped implies.
+    nonisolated static func purchaseSourceLabel(for d: Device) -> String {
+        switch d.axmPurchaseSource?.uppercased() {
+        case "APPLE":          return "Apple"
+        case "RESELLER":       return "Reseller"
+        case "MANUALLY_ADDED": return "Manually Added"
+        default:               return "Unknown"
+        }
+    }
+    nonisolated static func productFamilyLabel(for d: Device) -> String {
+        d.axmProductFamily?.isEmpty == false ? d.axmProductFamily! : "Unknown"
+    }
+    nonisolated static func addedToOrgYearLabel(for d: Device) -> String {
+        if let date = d.axmAddedToOrgDate, date.count >= 4 { return String(date.prefix(4)) }
+        return "Unknown"
+    }
+    nonisolated static func osMajorVersionLabel(for d: Device) -> String {
+        if let os = d.jamfOsVersion, let major = os.split(separator: ".").first, !major.isEmpty { return String(major) }
+        return "Unknown"
+    }
+    nonisolated static func fileVaultLabel(for d: Device) -> String {
+        switch d.jamfFileVaultStatus {
+        case "ALL_ENCRYPTED", "BOOT_ENCRYPTED": return "Encrypted"
+        case "NOT_ENCRYPTED":                   return "Not Encrypted"
+        default:                                return "Unknown"
+        }
+    }
+    nonisolated static func checkinBucketLabel(for d: Device) -> String {
+        guard let contact = d.jamfLastContact, let date = parseISO(contact) else { return "Never" }
+        let days = -date.timeIntervalSinceNow / 86_400
+        if days < 1       { return "Today" }
+        if days < 7       { return "This Week" }
+        if days > 30      { return "Stale (30+ days)" }
+        return "This Month"
+    }
+    /// Non-overlapping "days until coverage ends" bucket for devices currently in
+    /// warranty. Returns nil for anything that isn't a live, upcoming expiry —
+    /// already out-of-warranty devices belong under "Out of Warranty", not here,
+    /// and anything beyond 90 days isn't "soon" yet.
+    nonisolated static func expiringWindowLabel(for d: Device) -> String? {
+        guard d.coverageStatus == .active,
+              let endStr = d.axmCoverageEndDate,
+              let end = ymdParser.date(from: endStr) else { return nil }
+        let daysOut = end.timeIntervalSinceNow / 86_400
+        guard daysOut >= 0 else { return nil }  // end date already passed but status hasn't caught up
+        if daysOut <= 30 { return "0–30" }
+        if daysOut <= 60 { return "31–60" }
+        if daysOut <= 90 { return "61–90" }
+        return nil
+    }
+
+    // Single O(n) pass over a device array, producing every dashboard breakdown.
+    // Pulled out as a pure nonisolated function so it can run against the full
+    // device list (recomputeStats) or a facet-filtered subset (the Jamf dashboard's
+    // filter bar) without duplicating this loop.
+    nonisolated static func computeStats(from devices: [Device]) -> DashboardStats {
         var s = DashboardStats()
         s.total = devices.count
 
@@ -473,7 +797,82 @@ final class AppStore: ObservableObject {
                     s.mdmUnassigned += 1
                 }
             }
+
+            // Dashboard "Apple Manager" focus breakdowns — AxM-sourced fields only.
+            // expiringWindowLabel is computed once per device and shared with the
+            // Jamf-focus block below (for .both devices) — matches the file's single
+            // O(n)-pass principle: no need to parse axmCoverageEndDate twice per device.
+            let expiringLabel = Self.expiringWindowLabel(for: d)
+            if d.deviceSource != .jamfOnly {
+                s.axmProductFamilyBreakdown[Self.productFamilyLabel(for: d), default: 0] += 1
+                s.axmPurchaseSourceBreakdown[Self.purchaseSourceLabel(for: d), default: 0] += 1
+                s.axmOrderYearBreakdown[Self.addedToOrgYearLabel(for: d), default: 0] += 1
+
+                switch expiringLabel {
+                case "0–30":  s.axmExpiring30 += 1
+                case "31–60": s.axmExpiring60 += 1
+                case "61–90": s.axmExpiring90 += 1
+                default: break
+                }
+            }
+
+            // Dashboard "Jamf Pro" focus breakdowns — Jamf-sourced fields only
+            if d.deviceSource != .axmOnly {
+                if d.jamfDeviceType == "mobile" { s.jamfMobileCount += 1 } else { s.jamfComputerCount += 1 }
+
+                // Bucketed separately by device type — mixing Mac and mobile OS numbers into
+                // one list is meaningless, since e.g. macOS 26 and iOS 26 share a version number
+                // under Apple's unified yearly versioning but are entirely different OSes.
+                let osLabel = Self.osMajorVersionLabel(for: d)
+                if d.jamfDeviceType == "mobile" {
+                    s.jamfMobileOsVersionBreakdown[osLabel, default: 0] += 1
+                } else {
+                    s.jamfMacOsVersionBreakdown[osLabel, default: 0] += 1
+                }
+
+                // FileVault only applies to computers — mobile devices have no encryption state to report.
+                if d.jamfDeviceType == "computer" {
+                    switch Self.fileVaultLabel(for: d) {
+                    case "Encrypted":     s.jamfFileVaultEncrypted    += 1
+                    case "Not Encrypted": s.jamfFileVaultNotEncrypted += 1
+                    default:              s.jamfFileVaultUnknown      += 1
+                    }
+                }
+
+                switch Self.checkinBucketLabel(for: d) {
+                case "Today":            s.jamfCheckinToday     += 1
+                case "This Week":        s.jamfCheckinThisWeek  += 1
+                case "This Month":       s.jamfCheckinThisMonth += 1
+                case "Stale (30+ days)": s.jamfCheckinStale     += 1
+                default:                 s.jamfCheckinNever     += 1
+                }
+
+                // AxM coverage expiry and distribution, but only for devices Jamf also
+                // has a record of — the Jamf dashboard's cards should never count an
+                // AxM-only device.
+                if d.deviceSource == .both {
+                    switch expiringLabel {
+                    case "0–30":  s.axmExpiring30InJamf += 1
+                    case "31–60": s.axmExpiring60InJamf += 1
+                    case "61–90": s.axmExpiring90InJamf += 1
+                    default: break
+                    }
+
+                    switch d.coverageStatus {
+                    case .active:                          s.jamfCoverageActive       += 1
+                    case .inactive, .expired, .cancelled:   s.jamfCoverageInactive     += 1
+                    case .noCoverage:                       s.jamfCoverageNoPlan       += 1
+                    case .notFetched:                       s.jamfCoverageNeverFetched += 1
+                    }
+                }
+            }
         }
+
+        return s
+    }
+
+    func recomputeStats() {
+        var s = Self.computeStats(from: devices)
 
         s.lastAxmSync      = prefs.display(prefs.lastAxmSync)
         s.lastJamfSync     = prefs.display(prefs.lastJamfSync)
@@ -482,6 +881,209 @@ final class AppStore: ObservableObject {
         stats = s
         // Also refresh filtered list after stats recalc (devices may have changed)
         applyFilterNow()
+        recomputeJamfDashboardStats()
+        recomputeAxmDashboardStats()
+        recomputeCommonDashboardStats()
+    }
+
+    /// A write-deferred binding to a facet property. SwiftUI's segmented `Picker`
+    /// can push its selection back into the binding from inside `updateNSView`
+    /// (a view-update pass) — a direct `@Published` write there trips the
+    /// "Publishing changes from within view updates" runtime warning. Hopping the
+    /// write to the next main-runloop turn keeps the mutation out of that pass.
+    /// The `Menu`-based `FacetChipMenu` writes from a `Button` action (already an
+    /// event, not an update) and doesn't need this.
+    func facetBinding<T>(_ keyPath: ReferenceWritableKeyPath<AppStore, T>) -> Binding<T> {
+        Binding(
+            get: { self[keyPath: keyPath] },
+            set: { newValue in
+                DispatchQueue.main.async { self[keyPath: keyPath] = newValue }
+            }
+        )
+    }
+
+    // MARK: - Jamf dashboard facet filter bar
+    // Independent of the Devices tab's own filters (jamfManagedFilter etc. above) —
+    // this is a dashboard-only lens so flipping a facet here never changes what the
+    // Devices tab shows, and vice versa. Every card on the Jamf dashboard reads from
+    // jamfDashboardStats instead of the unfiltered `stats`.
+    @Published var jamfDashboardManagedFacet:    Bool?       = nil { didSet { recomputeJamfDashboardStats() } }
+    @Published var jamfDashboardDeviceTypeFacet: DeviceKind? = nil { didSet { recomputeJamfDashboardStats() } }
+    @Published var jamfDashboardFileVaultFacet:  String?     = nil { didSet { recomputeJamfDashboardStats() } }
+    @Published var jamfDashboardCheckinFacet:    String?     = nil { didSet { recomputeJamfDashboardStats() } }
+    @Published private(set) var jamfDashboardStats = DashboardStats()
+    private var jamfDashboardStatsGeneration = 0
+
+    var jamfDashboardFacetCount: Int {
+        [jamfDashboardManagedFacet != nil, jamfDashboardDeviceTypeFacet != nil,
+         jamfDashboardFileVaultFacet != nil, jamfDashboardCheckinFacet != nil].filter { $0 }.count
+    }
+
+    func clearJamfDashboardFacets() {
+        jamfDashboardManagedFacet    = nil
+        jamfDashboardDeviceTypeFacet = nil
+        jamfDashboardFileVaultFacet  = nil
+        jamfDashboardCheckinFacet    = nil
+    }
+
+    private nonisolated static func matchesJamfDashboardFacets(_ d: Device,
+        managed: Bool?, deviceType: DeviceKind?, fileVault: String?, checkin: String?
+    ) -> Bool {
+        guard d.deviceSource != .axmOnly else { return false }   // Jamf dashboard population
+        if let m = managed,     d.isManaged   != m  { return false }
+        if let dt = deviceType, d.deviceKind   != dt { return false }
+        if let fv = fileVault,  Self.fileVaultLabel(for: d)   != fv { return false }
+        if let ck = checkin,    Self.checkinBucketLabel(for: d) != ck { return false }
+        return true
+    }
+
+    // Filters + recomputes off the main thread (mirrors applyFilterNow()'s detached
+    // Task) — a 30k-device pass is cheap, but there's no reason to block the UI for it.
+    // Generation counter discards a stale result if facets are toggled again before
+    // an in-flight recompute finishes.
+    func recomputeJamfDashboardStats() {
+        jamfDashboardStatsGeneration += 1
+        let myGeneration = jamfDashboardStatsGeneration
+        let snapshot   = devices
+        let managed    = jamfDashboardManagedFacet
+        let deviceType = jamfDashboardDeviceTypeFacet
+        let fileVault  = jamfDashboardFileVaultFacet
+        let checkin    = jamfDashboardCheckinFacet
+        Task.detached(priority: .userInitiated) {
+            let filtered = snapshot.filter {
+                AppStore.matchesJamfDashboardFacets($0, managed: managed, deviceType: deviceType,
+                                                     fileVault: fileVault, checkin: checkin)
+            }
+            let result = AppStore.computeStats(from: filtered)
+            await MainActor.run { [weak self] in
+                guard let self, myGeneration == self.jamfDashboardStatsGeneration else { return }
+                self.jamfDashboardStats = result
+            }
+        }
+    }
+
+    // MARK: - Apple (AxM) dashboard facet filter bar
+    // Same dashboard-only-lens model as the Jamf bar above: flipping a facet here
+    // never touches the Devices tab's own filters. Every card on the Apple focus
+    // dashboard reads axmDashboardStats instead of the unfiltered `stats`.
+    // Population is AxM-having devices (deviceSource != .jamfOnly), mirroring the
+    // deviceSource scoping the AxM breakdowns use in computeStats.
+    @Published var axmDashboardStatusFacet:         String? = nil { didSet { recomputeAxmDashboardStats() } }  // "ACTIVE" / "RELEASED"
+    @Published var axmDashboardProductFamilyFacet:  String? = nil { didSet { recomputeAxmDashboardStats() } }  // productFamilyLabel
+    @Published var axmDashboardPurchaseSourceFacet: String? = nil { didSet { recomputeAxmDashboardStats() } }  // "Apple" / "Reseller" / "Manually Added" / "Unknown"
+    @Published var axmDashboardMdmFacet:            String? = nil { didSet { recomputeAxmDashboardStats() } }  // mdmAssignedSentinel / mdmUnassignedSentinel
+    @Published private(set) var axmDashboardStats = DashboardStats()
+    private var axmDashboardStatsGeneration = 0
+
+    var axmDashboardFacetCount: Int {
+        [axmDashboardStatusFacet != nil, axmDashboardProductFamilyFacet != nil,
+         axmDashboardPurchaseSourceFacet != nil, axmDashboardMdmFacet != nil].filter { $0 }.count
+    }
+
+    func clearAxmDashboardFacets() {
+        axmDashboardStatusFacet         = nil
+        axmDashboardProductFamilyFacet  = nil
+        axmDashboardPurchaseSourceFacet = nil
+        axmDashboardMdmFacet            = nil
+    }
+
+    private nonisolated static func matchesAxmDashboardFacets(_ d: Device,
+        status: String?, productFamily: String?, purchaseSource: String?, mdm: String?
+    ) -> Bool {
+        guard d.deviceSource != .jamfOnly else { return false }   // Apple dashboard population
+        if let st = status,         (d.axmDeviceStatus?.uppercased() ?? "") != st          { return false }
+        if let pf = productFamily,  Self.productFamilyLabel(for: d)         != pf           { return false }
+        if let ps = purchaseSource, Self.purchaseSourceLabel(for: d)        != ps           { return false }
+        if let m = mdm {
+            if m == AppStore.mdmUnassignedSentinel {
+                if d.axmAssignmentStatus != "Unassigned" { return false }
+            } else if m == AppStore.mdmAssignedSentinel {
+                if d.axmAssignmentStatus == "Unassigned" || d.axmAssignmentStatus == nil { return false }
+            } else if d.assignedMdmServerName != m {
+                return false
+            }
+        }
+        return true
+    }
+
+    func recomputeAxmDashboardStats() {
+        axmDashboardStatsGeneration += 1
+        let myGeneration = axmDashboardStatsGeneration
+        let snapshot = devices
+        let status   = axmDashboardStatusFacet
+        let family   = axmDashboardProductFamilyFacet
+        let purchase = axmDashboardPurchaseSourceFacet
+        let mdm      = axmDashboardMdmFacet
+        Task.detached(priority: .userInitiated) {
+            let filtered = snapshot.filter {
+                AppStore.matchesAxmDashboardFacets($0, status: status, productFamily: family,
+                                                    purchaseSource: purchase, mdm: mdm)
+            }
+            let result = AppStore.computeStats(from: filtered)
+            await MainActor.run { [weak self] in
+                guard let self, myGeneration == self.axmDashboardStatsGeneration else { return }
+                self.axmDashboardStats = result
+            }
+        }
+    }
+
+    // MARK: - Default (Common) dashboard facet filter bar
+    // Same dashboard-only-lens model. Population is the whole reconciled fleet —
+    // no deviceSource pre-filter — so a Source facet is itself one of the lenses.
+    @Published var commonDashboardSourceFacet:   DeviceSource?   = nil { didSet { recomputeCommonDashboardStats() } }
+    @Published var commonDashboardCoverageFacet: CoverageStatus? = nil { didSet { recomputeCommonDashboardStats() } }
+    @Published var commonDashboardWbFacet:       WBStatus?       = nil { didSet { recomputeCommonDashboardStats() } }
+    @Published var commonDashboardManagedFacet:  Bool?           = nil { didSet { recomputeCommonDashboardStats() } }
+    @Published private(set) var commonDashboardStats = DashboardStats()
+    private var commonDashboardStatsGeneration = 0
+
+    var commonDashboardFacetCount: Int {
+        [commonDashboardSourceFacet != nil, commonDashboardCoverageFacet != nil,
+         commonDashboardWbFacet != nil, commonDashboardManagedFacet != nil].filter { $0 }.count
+    }
+
+    func clearCommonDashboardFacets() {
+        commonDashboardSourceFacet   = nil
+        commonDashboardCoverageFacet = nil
+        commonDashboardWbFacet       = nil
+        commonDashboardManagedFacet  = nil
+    }
+
+    private nonisolated static func matchesCommonDashboardFacets(_ d: Device,
+        source: DeviceSource?, coverage: CoverageStatus?, wb: WBStatus?, managed: Bool?
+    ) -> Bool {
+        if let src = source, d.deviceSource != src { return false }
+        // Grouped by label so the "Out of Warranty" facet catches inactive/expired/
+        // cancelled together — matching how the dashboard's own cards count them.
+        if let cov = coverage, d.coverageStatus.label != cov.label { return false }
+        if let w = wb {
+            guard d.deviceSource != .axmOnly, d.wbStatus == w else { return false }
+        }
+        if let m = managed {
+            guard d.deviceSource != .axmOnly, d.isManaged == m else { return false }
+        }
+        return true
+    }
+
+    func recomputeCommonDashboardStats() {
+        commonDashboardStatsGeneration += 1
+        let myGeneration = commonDashboardStatsGeneration
+        let snapshot = devices
+        let source   = commonDashboardSourceFacet
+        let coverage = commonDashboardCoverageFacet
+        let wb       = commonDashboardWbFacet
+        let managed  = commonDashboardManagedFacet
+        Task.detached(priority: .userInitiated) {
+            let filtered = snapshot.filter {
+                AppStore.matchesCommonDashboardFacets($0, source: source, coverage: coverage,
+                                                       wb: wb, managed: managed)
+            }
+            let result = AppStore.computeStats(from: filtered)
+            await MainActor.run { [weak self] in
+                guard let self, myGeneration == self.commonDashboardStatsGeneration else { return }
+                self.commonDashboardStats = result
+            }
+        }
     }
 
     // MARK: - Credentials
@@ -493,11 +1095,35 @@ final class AppStore: ObservableObject {
         }
     }
     func saveJamfCredentials() {
+        // S2: capture the mapping-trust baseline BEFORE persisting the new values.
+        let newOrigin  = jamfCredentials.canonicalOrigin
+        let prevOrigin = prefs.jamfValidatedOrigin
+
         if let envId = environmentId {
             KeychainService.saveJamfCredentialsForEnv(jamfCredentials, id: envId)
         } else {
             KeychainService.saveJamfCredentials(jamfCredentials)
         }
+
+        // A blank previous origin means there was nothing to invalidate yet (brand-new
+        // environment). Just record the baseline. Also covers the first save on the
+        // legacy v1 store, where onJamfRebindingDetected is nil anyway.
+        guard !prevOrigin.isEmpty else {
+            prefs.jamfValidatedOrigin = newOrigin
+            return
+        }
+        guard prevOrigin != newOrigin else { return }
+
+        // The Jamf host and/or client changed. Every cached serial→Jamf-ID mapping was
+        // built against the old host and must not be used for write-back until it is
+        // re-confirmed against the new one (S2 — see ARCHITECTURE.md).
+        prefs.jamfValidatedOrigin = newOrigin
+        log.warn("Jamf connection changed — write-back paused for all devices until the serial→Jamf-ID mapping is re-confirmed against the new host. Starting a full Jamf re-fetch…")
+        Task {
+            await persistence.markJamfMappingsPendingRevalidation()
+            await loadDevicesFromCoreDataSync()
+        }
+        onJamfRebindingDetected?()
     }
 
     // MARK: - Export columns
@@ -511,10 +1137,14 @@ final class AppStore: ObservableObject {
             axmAuthStatus = .failure("Fill in Client ID, Key ID, and choose a private key file.")
             return
         }
+        guard let envId = environmentId else {
+            axmAuthStatus = .failure("No active environment — reopen the app and try again.")
+            return
+        }
         axmAuthStatus = .testing
-        let svc = ABMService(credentials: axmCredentials)
+        let svc = ABMService(credentials: axmCredentials, environmentId: envId, log: log)
         do {
-            _ = try await svc.validToken()
+            try await svc.verifyCredentials()
             axmAuthStatus = .success("Token obtained successfully")
         } catch {
             axmAuthStatus = .failure(error.localizedDescription)

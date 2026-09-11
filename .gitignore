@@ -1,1 +1,73 @@
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+
+# Xcode — per-user state (never share)
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+!default.xcworkspace
+
+# Xcode — build output
+build/
+DerivedData/
+*.xcarchive
+*.xcresult
+Archives/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+!AxMJamfSync.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Signing / secrets — never commit keys or exported credentials
+*.p8
+*.pem
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.certSigningRequest
+ExportOptions.plist
+*.env
+.env*
+
+# App data that might get dragged into the repo by mistake
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+Diagnostics-*.zip
+
+# Claude Code — share project skills/settings, not per-user overrides
+.claude/settings.local.json
+.claude/*.local.*
+
+# Editors / tools
+.idea/
+.vscode/
+*.swp
+*~
+.swiftlint-cache/
+fastlane/report.xml
+fastlane/screenshots/**/*.png
+fastlane/test_output
+/.claude
+ARCHITECTURE.md
+CLAUDE.md
+docs/IMPLEMENTATION_PLAN.md
+SETUP_GUIDE.md

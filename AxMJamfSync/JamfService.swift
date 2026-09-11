@@ -5,10 +5,16 @@
 //        TTL = 59s from server. Token passed explicitly to concurrent PATCH tasks
 //        to avoid 8× redundant fetchToken() calls.
 //
-// Computers: GET /api/v3/computers-inventory  (paginated, serialNumber in hardware{})
+// Computers: GET /api/v4/computers-inventory  (paginated, serialNumber in hardware{})
 // Mobile:    GET /api/v2/mobile-devices/detail (paginated, serialNumber in hardware{})
-// PATCH computer: PATCH /api/v3/computers-inventory-detail/{id}  body: {purchasing:{…}}
+// PATCH computer: PATCH /api/v4/computers-inventory-detail/{id}  body: {purchasing:{…}}
 // PATCH mobile:   PATCH /api/v2/mobile-devices/{id}              body: {ios:{purchasing:{…}}}
+//
+// v3→v4 migration note (Jamf Pro 11.30): the `general` object renamed lastContactTime
+// to lastCheckIn (we've switched to it below — it's Jamf's more complete check-in
+// signal, covering binary/MDM/DDM contact rather than just one method) and removed
+// lastReportedIp (we never used it). All other general fields are unchanged, and the
+// `section` query parameter and pagination/sort/filter mechanics are identical to v3.
 
 import Foundation
 
@@ -19,7 +25,7 @@ private struct JamfTokenResponse: Decodable {
     let expires_in:   Int
 }
 
-/// Top-level paginated response from /api/v3/computers-inventory
+/// Top-level paginated response from /api/v4/computers-inventory
 private struct JamfInventoryResponse: Decodable {
     let totalCount: Int
     let results:    [JamfInventoryRecord]
@@ -44,15 +50,21 @@ private struct JamfOperatingSystem: Decodable {
     let supplementalBuildVersion: String?
     let rapidSecurityResponse:   String?
     let activeDirectoryStatus:   String?
-    let fileVault2Status:        String?   // "ALL_ENCRYPTED" | "NOT_ENCRYPTED" | "UNKNOWN"
+    let fileVault2Status:        String?   // "ALL_ENCRYPTED" | "BOOT_ENCRYPTED" | "NOT_ENCRYPTED" | "UNKNOWN" — both ALL_ and BOOT_ENCRYPTED count as Encrypted, see AppStore.fileVaultLabel(for:)
     let softwareUpdateDeviceId:  String?
 }
 
 private struct JamfGeneral: Decodable {
     let name:              String?
     let reportDate:        String?
-    let lastContactTime:   String?
+    let lastCheckIn:       String?   // renamed from lastContactTime in v4 — Jamf's fuller check-in signal (binary/MDM/DDM)
     let lastEnrolledDate:  String?
+    let mdmProfileExpiration: String?   // date-time. NOT "mdmCertificateExpiration" — that name
+    // appears in some Jamf docs/schemas, but a live v4 payload confirmed the actual JSON key is
+    // "mdmProfileExpiration". Decoding the wrong key silently produced nil forever (Optional
+    // properties don't throw on a missing key) — this was the real root cause of the field
+    // appearing "missing", not a date-format parsing issue as originally suspected.
+    let initialEntryDate:  String?   // plain date "YYYY-MM-DD" — date device was first added to Jamf
     let managementId:      String?
     let remoteManagement:  JamfRemoteManagement?
     let udid:              String?
@@ -216,6 +228,16 @@ private struct JamfMobilePurchasing: Decodable {
         guard let r = raw, !r.isEmpty else { return nil }
         return r.count >= 10 ? String(r.prefix(10)) : r
     }
+
+    // writeWarrantyBackMobile sends poDate to Jamf's mobile v2 API as a full
+    // ISO8601 datetime (it rejects a bare date), and Jamf echoes it back that way.
+    // Normalise to YYYY-MM-DD on read so the "changed in console?" comparison in
+    // the merge doesn't see "2019-01-01T00:00:00.000Z" != "2019-01-01" and
+    // re-queue the device for write-back on every sync. See ARCHITECTURE.md.
+    var resolvedPoDate: String? {
+        guard let r = poDate, !r.isEmpty else { return nil }
+        return r.count >= 10 ? String(r.prefix(10)) : r
+    }
 }
 
 // MARK: - JamfService
@@ -225,6 +247,10 @@ actor JamfService {
     private let baseURL:      String  // trailing slash already stripped
     private let clientId:     String
     private let clientSecret: String
+    private let environmentId: UUID   // S1: token cache namespace — immutable, passed at init
+    private let tokenIdentity: String // S1: SHA-256(origin + clientId) the cached token is bound to
+    // S9: this environment's scoped log — every diagnostic here is about one env's run.
+    private let log: LogService
 
     private var cachedToken: String?
     private var tokenExpiry: Date = .distantPast
@@ -246,12 +272,16 @@ actor JamfService {
         return URLSession(configuration: cfg, delegate: TLSDelegate(), delegateQueue: nil)
     }()
 
-    init(credentials: JamfCredentials) {
-        self.baseURL      = credentials.url.hasSuffix("/")
+    init(credentials: JamfCredentials, environmentId: UUID, log: LogService) {
+        let normalizedURL = credentials.url.hasSuffix("/")
             ? String(credentials.url.dropLast())
             : credentials.url
-        self.clientId     = credentials.clientId
-        self.clientSecret = credentials.clientSecret
+        self.baseURL       = normalizedURL
+        self.clientId      = credentials.clientId
+        self.clientSecret  = credentials.clientSecret
+        self.environmentId = environmentId
+        self.tokenIdentity = KeychainService.tokenIdentity(origin: normalizedURL, clientId: credentials.clientId)
+        self.log           = log
     }
 
     // MARK: - Public: fetch all computers
@@ -259,7 +289,7 @@ actor JamfService {
     /// Mirrors device_sync.py → _JamfClient.fetch_all_computers()
     func fetchComputers(
         pageSize: Int = 200,
-        onProgress: @MainActor (Int, Int) -> Void
+        onProgress: @Sendable @MainActor (Int, Int) -> Void
     ) async throws -> [RawJamfComputer] {
 
         let clampedPageSize = min(max(pageSize, 10), 2000)
@@ -279,7 +309,7 @@ actor JamfService {
 
             // section must be sent as repeated query items — same as Python's list param
             // URLComponents doesn't deduplicate, so build URL manually.
-            let urlStr = baseURL + "/api/v3/computers-inventory"
+            let urlStr = baseURL + "/api/v4/computers-inventory"
             guard var components = URLComponents(string: urlStr) else {
                 throw JamfError.networkError("Invalid Jamf URL: \(urlStr)")
             }
@@ -301,14 +331,14 @@ actor JamfService {
             request.setValue("application/json", forHTTPHeaderField: "Accept")
 
             let (data, response) = try await session.data(for: request)
-            try await validateHTTP(response, data: data, context: "Jamf /api/v3/computers-inventory page \(page)")
+            try await validateHTTP(response, data: data, context: "Jamf /api/v4/computers-inventory page \(page)")
 
             let decoded = try JSONDecoder().decode(JamfInventoryResponse.self, from: data)
 
             if page == 0 {
                 total = decoded.totalCount
                 await onProgress(0, total)
-                await LogService.shared.debug("[Jamf] Page 0 — totalCount=\(decoded.totalCount)")
+                await log.debug("[Jamf] Page 0 — totalCount=\(decoded.totalCount)")
             }
 
             let batch = decoded.results
@@ -364,8 +394,10 @@ actor JamfService {
                     batteryCapacityPercent: hw?.batteryCapacityPercent,
                     appleSiliconStatus:  hw?.appleSiliconStatus,
                     reportDate:          g?.reportDate,
-                    lastContactTime:     g?.lastContactTime,
+                    lastCheckIn:         g?.lastCheckIn,
                     enrolledDate:        g?.lastEnrolledDate,
+                    mdmCertificateExpiration: g?.mdmProfileExpiration,
+                    initialEntryDate:    g?.initialEntryDate,
                     managementId:        g?.managementId,
                     warrantyDate:        p?.warrantyDate,
                     vendor:              p?.vendor,
@@ -409,7 +441,7 @@ actor JamfService {
     // MARK: - Public: write back AppleCare data to Jamf purchasing fields
 
     /// Mirrors device_sync.py → _patch_with_backoff() + sync_jamf_writeback()
-    /// PATCH /api/v3/computers-inventory-detail/{jamfId}
+    /// PATCH /api/v4/computers-inventory-detail/{jamfId}
     /// Body: { "purchasing": { "appleCareId": "…", "warrantyDate": "YYYY-MM-DD", "vendor": "…" } }
     func writeWarrantyBack(
         jamfId:         String,
@@ -418,8 +450,17 @@ actor JamfService {
         vendor:         String?,    // "purchaseSourceType (purchaseSourceId)"
         poNumber:       String?,    // from axm_order_number
         poDate:         String?,    // YYYY-MM-DD from axm_order_date
+        mappingValidated: Bool = true,  // S2: false = serial→jamfId map not confirmed against this host
         token:          String? = nil  // pre-fetched token — avoids N concurrent validToken() calls
     ) async throws {
+
+        // S2: refuse to PATCH by a jamfId whose serial mapping hasn't been re-confirmed
+        // against the currently configured host. SyncEngine already filters these out;
+        // this is the last-line guard so a mapping built against a different Jamf host
+        // can never silently write warranty data to the wrong device.
+        guard mappingValidated else {
+            throw JamfError.mappingNotValidated(jamfId)
+        }
 
         // Build the purchasing dict — only include non-empty fields (matches Python pre-flight check)
         var purchasing: [String: String] = [:]
@@ -435,7 +476,7 @@ actor JamfService {
 
         let resolvedToken = try await { if let t = token { return t }; return try await validToken() }()
         guard let safeId = jamfId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let url = URL(string: baseURL + "/api/v3/computers-inventory-detail/\(safeId)") else {
+              let url = URL(string: baseURL + "/api/v4/computers-inventory-detail/\(safeId)") else {
             throw JamfError.networkError("Invalid Jamf ID: \(jamfId)")
         }
 
@@ -448,7 +489,7 @@ actor JamfService {
         request.httpBody   = try JSONSerialization.data(withJSONObject: ["purchasing": purchasing])
 
         let (_, response) = try await session.data(for: request)
-        try validateHTTP(response, context: "Jamf PATCH /api/v3/computers-inventory-detail/\(jamfId)")
+        try validateHTTP(response, context: "Jamf PATCH /api/v4/computers-inventory-detail/\(jamfId)")
     }
 
 
@@ -456,7 +497,7 @@ actor JamfService {
     /// GET /api/v2/mobile-devices/detail?section=GENERAL&section=HARDWARE&section=USER_AND_LOCATION&section=PURCHASING
     func fetchMobileDevices(
         pageSize: Int = 200,
-        onProgress: @MainActor (Int, Int) -> Void
+        onProgress: @Sendable @MainActor (Int, Int) -> Void
     ) async throws -> [RawJamfMobileDevice] {
 
         let clampedPageSize = min(max(pageSize, 10), 2000)
@@ -498,12 +539,12 @@ actor JamfService {
             if page == 0 {
                 total = decoded.totalCount
                 await onProgress(0, total)
-                await LogService.shared.debug("[Jamf] Mobile page 0 — totalCount=\(decoded.totalCount), decoded \(decoded.results.count) records")
+                await log.debug("[Jamf] Mobile page 0 — totalCount=\(decoded.totalCount), decoded \(decoded.results.count) records")
             }
 
             let batch = decoded.results
             if batch.isEmpty {
-                await LogService.shared.debug("[Jamf] Mobile page \(page) — empty batch (totalCount=\(total), collected=\(results.count)). Stopping.")
+                await log.debug("[Jamf] Mobile page \(page) — empty batch (totalCount=\(total), collected=\(results.count)). Stopping.")
                 break
             }
 
@@ -531,7 +572,7 @@ actor JamfService {
                 // serialNumber is in hardware{} — confirmed from real API response
                 let serial = (hw?.serialNumber ?? "").uppercased().trimmingCharacters(in: .whitespaces)
                 guard !serial.isEmpty else {
-                    await LogService.shared.debug("[Jamf] Mobile: skipping record — empty serial (mobileDeviceId=\(record.mobileDeviceId))")
+                    await log.debug("[Jamf] Mobile: skipping record — empty serial (mobileDeviceId=\(record.mobileDeviceId))")
                     continue
                 }
 
@@ -568,7 +609,7 @@ actor JamfService {
                     appleCareId:      p?.appleCareId,
                     purchased:        p?.purchased,
                     poNumber:         p?.poNumber,
-                    poDate:           p?.poDate,
+                    poDate:           p?.resolvedPoDate,
                     purchasePrice:    p?.purchasePrice,
                     username:         ul?.username,
                     realname:         ul?.realName,
@@ -599,8 +640,14 @@ actor JamfService {
         vendor:         String?,    // "purchaseSourceType (purchaseSourceId)"
         poNumber:       String?,    // from axm_order_number
         poDate:         String?,    // YYYY-MM-DD from axm_order_date
+        mappingValidated: Bool = true,  // S2: see writeWarrantyBack
         token:          String? = nil  // pre-fetched token
     ) async throws {
+
+        // S2: last-line guard — see writeWarrantyBack.
+        guard mappingValidated else {
+            throw JamfError.mappingNotValidated(mobileDeviceId)
+        }
 
         var purchasing: [String: String] = [:]
         if let v = appleCareId,  !v.isEmpty { purchasing["appleCareId"]         = v }
@@ -649,27 +696,27 @@ actor JamfService {
         // Check in-memory cache first (fastest path)
         if let t = cachedToken, Date() < tokenExpiry.addingTimeInterval(-buffer) {
             let remaining = Int(tokenExpiry.timeIntervalSinceNow)
-            await LogService.shared.debug("[Jamf] Token: reusing cached token — \(remaining / 60)m \(remaining % 60)s remaining.")
+            await log.debug("[Jamf] Token: reusing cached token — \(remaining / 60)m \(remaining % 60)s remaining.")
             return t
         }
         // Check Keychain cache — survives app restarts.
         // Use same adaptive buffer to avoid returning a near-expired token.
-        if let cached = KeychainService.loadJamfToken(),
+        if let cached = KeychainService.loadJamfTokenForEnv(identity: tokenIdentity, envId: environmentId),
            Date() < cached.expiry.addingTimeInterval(-Double(max(10, min(60, cached.ttl / 2)))) {
             cachedToken = cached.token
             tokenExpiry = cached.expiry
             tokenTTL    = cached.ttl
             let remaining = Int(cached.expiry.timeIntervalSinceNow)
-            await LogService.shared.debug("[Jamf] Token: restored from Keychain — \(remaining / 60)m \(remaining % 60)s remaining.")
+            await log.debug("[Jamf] Token: restored from Keychain — \(remaining / 60)m \(remaining % 60)s remaining.")
             return cached.token
         }
-        await LogService.shared.debug("[Jamf] Token: fetching fresh token from \(baseURL)/api/v1/oauth/token…")
+        await log.debug("[Jamf] Token: fetching fresh token from \(baseURL)/api/v1/oauth/token…")
         let (token, ttl) = try await fetchToken()
         cachedToken = token
         tokenTTL    = ttl
         tokenExpiry = Date().addingTimeInterval(TimeInterval(ttl))
-        KeychainService.saveJamfToken(token, expiry: tokenExpiry, ttl: ttl)
-        await LogService.shared.debug("[Jamf] Token: received — TTL \(ttl)s (\(ttl / 60)m). Saved to Keychain.")
+        KeychainService.saveJamfTokenForEnv(token, expiry: tokenExpiry, ttl: ttl, identity: tokenIdentity, envId: environmentId)
+        await log.debug("[Jamf] Token: received — TTL \(ttl)s (\(ttl / 60)m). Saved to Keychain.")
         return token
     }
 
@@ -680,7 +727,7 @@ actor JamfService {
         cachedToken = nil
         tokenExpiry = .distantPast
         // S2: Evict from Keychain so the next launch fetches fresh.
-        KeychainService.clearJamfToken()
+        KeychainService.clearJamfTokenForEnv(id: environmentId)
         // Best-effort server-side revoke — ignore errors (safe URL construction)
         let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         if var components = URLComponents(string: base),
@@ -699,7 +746,7 @@ actor JamfService {
         cachedToken = nil
         tokenExpiry = .distantPast
         // S2: Evict from Keychain (mirrors invalidateToken without the server call).
-        KeychainService.clearJamfToken()
+        KeychainService.clearJamfTokenForEnv(id: environmentId)
     }
 
     private func fetchToken() async throws -> (token: String, ttl: Int) {
@@ -729,8 +776,7 @@ actor JamfService {
         let (data, response) = try await session.data(for: request)
 
         if let http = response as? HTTPURLResponse, http.statusCode == 401 {
-            let body = String(data: data, encoding: .utf8) ?? "<no body>"
-            await LogService.shared.error("[Jamf] Token endpoint HTTP 401 — check clientId/clientSecret. Response: \(body)")
+            await log.error("[Jamf] Token endpoint HTTP 401 — check clientId/clientSecret. Response: \(LogService.sanitizedResponseBody(data))")
             throw JamfError.authError("Jamf token rejected (401) — check clientId/clientSecret")
         }
         try await validateHTTP(response, data: data, context: "Jamf /api/v1/oauth/token")
@@ -752,14 +798,11 @@ actor JamfService {
 
     private func validateHTTP(_ response: URLResponse, data: Data, context: String) async throws {
         guard let http = response as? HTTPURLResponse else {
-            await LogService.shared.error("[Jamf] \(context): no HTTP response.")
+            await log.error("[Jamf] \(context): no HTTP response.")
             throw JamfError.networkError("\(context): no HTTP response")
         }
         guard (200..<300).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .prefix(500) ?? "<no body>"
-            await LogService.shared.error("[Jamf] \(context) HTTP \(http.statusCode) — \(body)")
+            await log.error("[Jamf] \(context) HTTP \(http.statusCode) — \(LogService.sanitizedResponseBody(data))")
             throw JamfError.httpError(context: context, statusCode: http.statusCode)
         }
     }
@@ -794,8 +837,10 @@ struct RawJamfComputer: Sendable {
     let appleSiliconStatus:  String?
     // General dates
     let reportDate:          String?
-    let lastContactTime:     String?
+    let lastCheckIn:         String?   // renamed from lastContactTime in v4
     let enrolledDate:        String?
+    let mdmCertificateExpiration: String?
+    let initialEntryDate:    String?   // "Enrolled Date" in UI — first-added-to-Jamf date, distinct from enrolledDate (most recent re-enrollment)
     let managementId:        String?
     // Purchasing
     let warrantyDate:        String?
@@ -881,6 +926,7 @@ enum JamfError: LocalizedError {
     case httpError(context: String, statusCode: Int)
     case noDataToWrite(String)
     case invalidURL(String)    // S1: malformed base URL
+    case mappingNotValidated(String)   // S2: serial→jamfId map not confirmed against the current host
 
     var errorDescription: String? {
         switch self {
@@ -889,6 +935,7 @@ enum JamfError: LocalizedError {
         case .httpError(let ctx, let code): return "Jamf: HTTP \(code) from \(ctx)"
         case .noDataToWrite(let m):         return "Jamf: No data — \(m)"
         case .invalidURL(let u):            return "Jamf: Invalid URL — \(u)"
+        case .mappingNotValidated(let id):  return "Jamf: mapping pending revalidation for id \(id) — skipped"
         }
     }
 }

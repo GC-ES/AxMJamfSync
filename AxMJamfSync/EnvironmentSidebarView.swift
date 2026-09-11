@@ -3,6 +3,7 @@
 // Lists environments with status indicators; allows add, rename, delete.
 
 import SwiftUI
+import AppKit
 
 // MARK: - Sidebar
 
@@ -14,6 +15,7 @@ struct EnvironmentSidebarView: View {
   @State private var renameText:       String  = ""
   @State private var deletingId:       UUID?   = nil
   @State private var showMultiSync     = false
+  @State private var deleteError:      String? = nil
 
   var body: some View {
     VStack(spacing: 0) {
@@ -77,7 +79,7 @@ struct EnvironmentSidebarView: View {
               isActive:   env.id == envStore.activeEnvironmentId,
               isRunning:  syncEngine.isRunning && env.id == envStore.activeEnvironmentId,
               isQueued:   envStore.syncQueue.dropFirst().contains(env.id),
-              canDelete:  envStore.canDelete(env.id),
+              blockReason: envStore.deletionBlockReason(env.id),
               onSelect:   { envStore.setActive(env.id) },
               onRename: {
                 renamingId = env.id
@@ -127,12 +129,23 @@ struct EnvironmentSidebarView: View {
       if let id = deletingId,
          let env = envStore.environments.first(where: { $0.id == id }) {
         DeleteEnvironmentSheet(env: env) {
-          envStore.delete(id)
+          let target = id
           deletingId = nil
+          Task {
+            do { try await envStore.delete(target) }
+            catch { deleteError = error.localizedDescription }
+          }
         } onCancel: {
           deletingId = nil
         }
       }
+    }
+    .alert("Couldn’t delete environment",
+           isPresented: Binding(get: { deleteError != nil },
+                                set: { if !$0 { deleteError = nil } })) {
+      Button("OK", role: .cancel) { deleteError = nil }
+    } message: {
+      Text(deleteError ?? "")
     }
   }
 }
@@ -140,16 +153,25 @@ struct EnvironmentSidebarView: View {
 // MARK: - Environment row
 
 struct EnvironmentRow: View {
-  let env:       AppEnvironment
-  let isActive:  Bool
-  let isRunning: Bool
-  let isQueued:  Bool
-  let canDelete: Bool
-  let onSelect:  () -> Void
-  let onRename:  () -> Void
-  let onDelete:  () -> Void
+  let env:         AppEnvironment
+  let isActive:    Bool
+  let isRunning:   Bool
+  let isQueued:    Bool
+  /// nil when the environment can be deleted; otherwise why it can't.
+  let blockReason: EnvironmentStore.DeletionBlockReason?
+  let onSelect:    () -> Void
+  let onRename:    () -> Void
+  let onDelete:    () -> Void
 
   @State private var isHovering = false
+
+  /// Deletable now.
+  private var canDelete: Bool { blockReason == nil }
+  /// Offer the control (disabled, with a reason) for a transient block; hide it
+  /// entirely only for the permanent "last environment" case.
+  private var showDeleteControl: Bool {
+    blockReason == nil || blockReason == .running || blockReason == .queued
+  }
 
   var body: some View {
     HStack(spacing: 8) {
@@ -186,16 +208,17 @@ struct EnvironmentRow: View {
       Spacer()
 
       // Delete button — visible on hover or when active
-      if (isHovering || isActive) && canDelete {
+      if (isHovering || isActive) && showDeleteControl {
         Button {
           onDelete()
         } label: {
           Image(systemName: "trash")
             .font(.caption)
-            .foregroundStyle(.red.opacity(0.7))
+            .foregroundStyle(.red.opacity(canDelete ? 0.7 : 0.25))
         }
         .buttonStyle(.plain)
-        .help("Delete this environment and all its data")
+        .disabled(!canDelete)
+        .help(blockReason?.userMessage ?? "Delete this environment and all its data")
         .transition(.opacity)
       }
     }
@@ -210,10 +233,10 @@ struct EnvironmentRow: View {
     .onHover { isHovering = $0 }
     .contextMenu {
       Button("Rename…") { onRename() }
-      if canDelete {
-        Divider()
-        Button("Delete…", role: .destructive) { onDelete() }
-      }
+      Divider()
+      Button("Delete…", role: .destructive) { onDelete() }
+        .disabled(!canDelete)
+      if let blockReason { Text(blockReason.userMessage) }
     }
     .padding(.horizontal, 4)
     .animation(.easeInOut(duration: 0.15), value: isHovering)
@@ -499,6 +522,7 @@ struct MultiSyncPopover: View {
 
 struct MigrationOverlayView: View {
   let status: String
+  var error: String? = nil
 
   var body: some View {
     ZStack {
@@ -506,23 +530,47 @@ struct MigrationOverlayView: View {
         .ignoresSafeArea()
 
       VStack(spacing: 16) {
-        ProgressView()
-          .fixedSize()
-          .scaleEffect(1.2)
+        if let error {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .font(.system(size: 30))
+            .foregroundStyle(.orange)
 
-        Text("Upgrading to v2.1")
-          .font(.headline)
+          Text("Upgrade couldn’t be completed")
+            .font(.headline)
 
-        Text(status.isEmpty ? "Migrating data…" : status)
-          .font(.callout)
-          .foregroundStyle(.secondary)
-          .multilineTextAlignment(.center)
-          .frame(maxWidth: 260)
+          Text(error)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 340)
 
-        Text("This happens once and only takes a moment.")
-          .font(.caption)
-          .foregroundStyle(.tertiary)
-          .multilineTextAlignment(.center)
+          Text("Nothing was deleted. Quit and reopen AxM Jamf Sync to try again.")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 340)
+
+          Button("Quit") { NSApplication.shared.terminate(nil) }
+            .keyboardShortcut(.defaultAction)
+        } else {
+          ProgressView()
+            .fixedSize()
+            .scaleEffect(1.2)
+
+          Text("Upgrading to v2.1")
+            .font(.headline)
+
+          Text(status.isEmpty ? "Migrating data…" : status)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 260)
+
+          Text("This happens once and only takes a moment.")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .multilineTextAlignment(.center)
+        }
       }
       .padding(28)
       .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))

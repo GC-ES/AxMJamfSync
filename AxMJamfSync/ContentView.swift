@@ -3,6 +3,7 @@
 // and the existing tab content on the right, scoped to the active environment.
 
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
   @EnvironmentObject private var store:     AppStore
@@ -81,7 +82,7 @@ struct ContentView: View {
               )
             }
           case .dashboard:
-            if store.hasData { DashboardView() }
+            if store.hasData { DashboardView(navigateToDevices: { selectedTab = .devices }) }
             else { LockedTabPlaceholder(reason: "Run your first sync to see device statistics and coverage summaries here.") }
           case .devices:
             if store.hasData { DevicesView() }
@@ -108,10 +109,22 @@ struct ContentView: View {
       for: NSApplication.willTerminateNotification)) { _ in
       appEngine.stop()
     }
+    // S7: a Core Data store that failed to load — surface it rather than letting a
+    // sync run against an unavailable store. EnvironmentStore already blocks the
+    // sync queue while this is set.
+    .alert("Device database unavailable",
+           isPresented: Binding(get: { envStore.persistenceLoadFailed },
+                                set: { _ in })) {
+      Button("Quit", role: .destructive) { NSApplication.shared.terminate(nil) }
+      Button("Continue Without Syncing", role: .cancel) { }
+    } message: {
+      Text((envStore.persistenceLoadFailureMessage.map { $0 + "\n\n" } ?? "")
+           + "Syncing is disabled until the app is relaunched. Your existing data is not shown.")
+    }
     // Blocking migration overlay — shown only on first v1→v2 launch
     .overlay {
-      if envStore.isMigrating {
-        MigrationOverlayView(status: envStore.migrationStatus)
+      if envStore.isMigrating || envStore.migrationError != nil {
+        MigrationOverlayView(status: envStore.migrationStatus, error: envStore.migrationError)
       }
     }
   }
@@ -453,7 +466,7 @@ struct AppHeaderBar: View {
 struct AboutPopover: View {
     @EnvironmentObject private var store: AppStore
 
-    private var scopeFull: String { store.axmCredentials.scope == .school ? "Apple School Manager (ASM)" : "Apple Business Manager (ABM)" }
+    private var scopeFull: String { store.axmCredentials.scope.label }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {

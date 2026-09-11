@@ -8,7 +8,7 @@
 //   on Apple Silicon. Devices are upserted one-by-one inside perform{}.
 // WAL + history tracking enabled for safe concurrent read/write.
 
-import CoreData
+@preconcurrency import CoreData
 import Foundation
 import os
 import SQLite3
@@ -35,6 +35,16 @@ final class PersistenceController: Sendable {
     // because we only mutate the container during init (before sharing).
     nonisolated let container: NSPersistentContainer
 
+    /// Environment this store belongs to (nil for the in-memory placeholder and the
+    /// legacy single-env store). Used by the deletion path to detach before wiping.
+    nonisolated let environmentId: UUID?
+
+    /// S7: non-nil when `loadPersistentStores` reported a failure. Written once, in
+    /// init's load callback (synchronous for SQLite), on the same "mutated only
+    /// around init" basis as `container` — hence `nonisolated(unsafe)`.
+    nonisolated(unsafe) private(set) var storeLoadError: String? = nil
+    var isStoreReady: Bool { storeLoadError == nil }
+
     var viewContext: NSManagedObjectContext { container.viewContext }
 
     /// The actual on-disk URL of the SQLite store — derived from the container
@@ -55,6 +65,7 @@ final class PersistenceController: Sendable {
     /// Used only for the Default (v1-migrated) environment.
     init(inMemory: Bool = false) {
         container = NSPersistentContainer(name: "AxMJamfSync")
+        environmentId = nil
 
         if inMemory {
             container.persistentStoreDescriptions.first?.url =
@@ -83,9 +94,10 @@ final class PersistenceController: Sendable {
 
         // Log CoreData load errors — don't fatalError in production (sandbox path issues
         // or migration failures should show an error, not a crash).
-        container.loadPersistentStores { desc, error in
+        container.loadPersistentStores { [self] desc, error in
             if let error {
                 os_log(.fault, "[CoreData] FATAL: failed to load store — %{public}@", error.localizedDescription)
+                storeLoadError = error.localizedDescription
                 // Post notification so AppStore/UI can show an alert rather than crash
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(
@@ -118,80 +130,149 @@ final class PersistenceController: Sendable {
 
         // Normal launch — store already exists, open it directly.
         if fm.fileExists(atPath: storeURL.path) {
-            self.init(storeURL: storeURL)
+            self.init(storeURL: storeURL, environmentId: environmentId)
             return
         }
 
         // First v2.0 launch for the Default environment — copy v1 data.
+        // Best-effort only: the authoritative, verify-before-commit migration runs in
+        // EnvironmentStore.runMigration() and will normally have put the store in place
+        // already. On failure stageAndVerifyV1Copy leaves no partial file behind, so
+        // init(storeURL:) below just opens a fresh empty store.
         let defaultId = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
         if environmentId == defaultId {
-            PersistenceController.copyV1Store(to: storeURL)
-        }
-
-        self.init(storeURL: storeURL)
-    }
-
-    /// Copies the v1 SQLite store to the destination URL.
-    ///
-    /// Strategy: open the v1 store via NSPersistentContainer (which forces a WAL
-    /// checkpoint, flushing all pending writes into the main .sqlite file), then
-    /// copy the .sqlite, -wal, and -shm files directly. Direct file copy is more
-    /// reliable than migratePersistentStore across different option sets.
-    private static func copyV1Store(to destURL: URL) {
-        // Step 1: open v1 store to force WAL checkpoint
-        let tempContainer = NSPersistentContainer(name: "AxMJamfSync")
-        guard let desc = tempContainer.persistentStoreDescriptions.first else {
-            os_log(.error, "[CoreData] copyV1Store: no store description found")
-            return
-        }
-        desc.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
-        desc.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
-        desc.shouldMigrateStoreAutomatically     = true
-        desc.shouldInferMappingModelAutomatically = true
-
-        var v1URL: URL? = nil
-        var loadError: Error? = nil
-        tempContainer.loadPersistentStores { _, error in
-            if let error { loadError = error; return }
-            v1URL = tempContainer.persistentStoreCoordinator.persistentStores.first?.url
-        }
-
-        if let loadError {
-            os_log(.error, "[CoreData] copyV1Store: failed to load v1 store — %{public}@",
-                   loadError.localizedDescription)
-            return
-        }
-        guard let v1URL else {
-            os_log(.error, "[CoreData] copyV1Store: could not resolve v1 store URL")
-            return
-        }
-
-        // Step 2: checkpoint WAL by closing all contexts cleanly
-        // Setting persistentStoreCoordinator to a fresh one forces SQLite to flush
-        try? tempContainer.persistentStoreCoordinator.remove(
-            tempContainer.persistentStoreCoordinator.persistentStores.first!
-        )
-
-        // Step 3: copy .sqlite, -wal, -shm to destination
-        let fm = FileManager.default
-        var copied = false
-        for ext in ["", "-wal", "-shm"] {
-            let src = URL(fileURLWithPath: v1URL.path + ext)
-            let dst = URL(fileURLWithPath: destURL.path + ext)
-            guard fm.fileExists(atPath: src.path) else { continue }
             do {
-                if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
-                try fm.copyItem(at: src, to: dst)
-                if ext.isEmpty { copied = true }
+                try PersistenceController.stageAndVerifyV1Copy(to: storeURL)
             } catch {
-                os_log(.error, "[CoreData] copyV1Store: copy failed for %{public}@ — %{public}@",
-                       ext.isEmpty ? ".sqlite" : ext, error.localizedDescription)
+                os_log(.error, "[CoreData] first-launch v1 copy skipped — %{public}@", error.localizedDescription)
             }
         }
 
-        if copied {
-            os_log(.default, "[CoreData] v1 store copied to %{public}@", destURL.lastPathComponent)
+        self.init(storeURL: storeURL, environmentId: environmentId)
+    }
+
+    /// S4: copy the v1 SQLite store into `destURL` as a verified, complete set.
+    ///
+    /// The copy is staged next to the destination, loaded via NSPersistentContainer
+    /// to prove it opens and holds the same number of devices as the v1 store, and
+    /// only then moved atomically into place. On any failure the staging files are
+    /// removed and the v1 store is left completely untouched — a half-written
+    /// destination can never be mistaken for a finished one (and, because a present
+    /// destination is what makes later launches skip the copy, that would otherwise
+    /// be permanent). Returns the verified device count.
+    @discardableResult
+    static func stageAndVerifyV1Copy(to destURL: URL) throws -> Int {
+        let fm   = FileManager.default
+        let exts = ["", "-wal", "-shm"]
+        let stagingURL = destURL.deletingPathExtension().appendingPathExtension("staging.sqlite")
+
+        // Clear staging files left by a previously interrupted attempt.
+        for ext in exts {
+            let p = stagingURL.path + ext
+            if fm.fileExists(atPath: p) { try? fm.removeItem(atPath: p) }
         }
+
+        // ── Open the v1 store: forces a WAL checkpoint and gives us its device count.
+        let srcContainer = NSPersistentContainer(name: "AxMJamfSync")
+        guard let desc = srcContainer.persistentStoreDescriptions.first else {
+            throw MigrationError.storeCopyFailed("no store description")
+        }
+        desc.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+        desc.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+        desc.shouldMigrateStoreAutomatically      = true
+        desc.shouldInferMappingModelAutomatically = true
+
+        var loadError: Error?
+        srcContainer.loadPersistentStores { _, error in loadError = error }
+        if let loadError {
+            throw MigrationError.storeCopyFailed("v1 store did not open: \(loadError.localizedDescription)")
+        }
+        guard let v1URL = srcContainer.persistentStoreCoordinator.persistentStores.first?.url else {
+            throw MigrationError.storeCopyFailed("v1 store URL unresolved")
+        }
+        let v1Count = deviceCount(in: srcContainer)
+        if v1Count < 0 { throw MigrationError.storeVerifyFailed("could not count v1 devices") }
+
+        // Release the coordinator's lock so the file bytes are quiescent for copying.
+        if let store = srcContainer.persistentStoreCoordinator.persistentStores.first {
+            try? srcContainer.persistentStoreCoordinator.remove(store)
+        }
+
+        // ── Stage a copy of every sidecar file that exists.
+        for ext in exts {
+            let src = v1URL.path + ext
+            guard fm.fileExists(atPath: src) else { continue }
+            do {
+                try fm.copyItem(atPath: src, toPath: stagingURL.path + ext)
+            } catch {
+                for e in exts { try? fm.removeItem(atPath: stagingURL.path + e) }
+                throw MigrationError.storeCopyFailed(
+                    "\(ext.isEmpty ? ".sqlite" : ext): \(error.localizedDescription)")
+            }
+        }
+
+        // ── Verify the staged set actually loads and holds the expected count.
+        do {
+            let check = NSPersistentContainer(name: "AxMJamfSync")
+            let cd    = NSPersistentStoreDescription(url: stagingURL)
+            cd.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+            cd.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+            cd.shouldMigrateStoreAutomatically      = true
+            cd.shouldInferMappingModelAutomatically = true
+            check.persistentStoreDescriptions = [cd]
+
+            var checkError: Error?
+            check.loadPersistentStores { _, error in checkError = error }
+            if let checkError {
+                throw MigrationError.storeVerifyFailed("staged store did not open: \(checkError.localizedDescription)")
+            }
+            let stagedCount = deviceCount(in: check)
+            guard stagedCount == v1Count else {
+                throw MigrationError.storeVerifyFailed("device count \(stagedCount) != expected \(v1Count)")
+            }
+            if let store = check.persistentStoreCoordinator.persistentStores.first {
+                try? check.persistentStoreCoordinator.remove(store)
+            }
+        } catch {
+            for e in exts { try? fm.removeItem(atPath: stagingURL.path + e) }
+            throw error
+        }
+
+        // ── Move the verified set into place: sidecars first, main file last, so an
+        // interrupted move never leaves a valid-looking destination without its data.
+        do {
+            for ext in exts where !ext.isEmpty {
+                let dst = destURL.path + ext
+                if fm.fileExists(atPath: dst) { try fm.removeItem(atPath: dst) }
+                if fm.fileExists(atPath: stagingURL.path + ext) {
+                    try fm.moveItem(atPath: stagingURL.path + ext, toPath: dst)
+                }
+            }
+            if fm.fileExists(atPath: destURL.path) { try fm.removeItem(atPath: destURL.path) }
+            try fm.moveItem(atPath: stagingURL.path, toPath: destURL.path)
+        } catch {
+            for e in exts { try? fm.removeItem(atPath: stagingURL.path + e) }
+            throw MigrationError.storeCopyFailed("final move: \(error.localizedDescription)")
+        }
+
+        os_log(.default, "[CoreData] v1 store staged, verified (%d device(s)) and moved to %{public}@",
+               v1Count, destURL.lastPathComponent)
+        return v1Count
+    }
+
+    /// CDDevice row count for a loaded container, or -1 on failure.
+    private static func deviceCount(in container: NSPersistentContainer) -> Int {
+        let ctx = container.newBackgroundContext()
+        return ctx.performAndWait {
+            let req = NSFetchRequest<NSNumber>(entityName: "CDDevice")
+            req.resultType = .countResultType
+            return (try? ctx.count(for: req)) ?? -1
+        }
+    }
+
+    /// On-disk URL of a specific environment's SQLite store.
+    static func environmentStoreURL(_ id: UUID) -> URL {
+        environmentsDirectory.appendingPathComponent("\(id.uuidString).sqlite")
     }
 
     /// Returns the directory where all per-environment SQLite stores live.
@@ -210,8 +291,9 @@ final class PersistenceController: Sendable {
     }()
 
     /// Internal init for a specific store URL.
-    init(storeURL: URL) {
+    init(storeURL: URL, environmentId: UUID? = nil) {
         container = NSPersistentContainer(name: "AxMJamfSync")
+        self.environmentId = environmentId
         let desc  = NSPersistentStoreDescription(url: storeURL)
         desc.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
         desc.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
@@ -219,10 +301,11 @@ final class PersistenceController: Sendable {
         desc.shouldInferMappingModelAutomatically  = true
         container.persistentStoreDescriptions = [desc]
 
-        container.loadPersistentStores { _, error in
+        container.loadPersistentStores { [self] _, error in
             if let error {
                 os_log(.fault, "[CoreData] Failed to load store at %{public}@ — %{public}@",
                        storeURL.lastPathComponent, error.localizedDescription)
+                storeLoadError = error.localizedDescription
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .persistenceLoadFailed,
                                                     object: error.localizedDescription)
@@ -233,18 +316,53 @@ final class PersistenceController: Sendable {
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
         container.viewContext.name        = "viewContext"
         purgeHistoryTransactions()
+        if let environmentId, storeLoadError == nil { PersistenceController.register(self, for: environmentId) }
     }
 
-    // MARK: - v2.0 Environment wipe
+    // MARK: - v2.0 Environment teardown (S5)
+
+    /// Process-wide weak registry of loaded per-environment stores, so the deletion
+    /// path can detach a store's persistent coordinator BEFORE its SQLite files are
+    /// removed — even when EnvironmentStore holds no strong reference to it (e.g. a
+    /// store still retained by a background engine the user switched away from).
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var loadedStores: [UUID: WeakBox] = [:]
+    private final class WeakBox { weak var value: PersistenceController?; init(_ v: PersistenceController) { value = v } }
+
+    private static func register(_ controller: PersistenceController, for id: UUID) {
+        registryLock.lock(); defer { registryLock.unlock() }
+        loadedStores[id] = WeakBox(controller)
+    }
+
+    /// The live store for an environment, if one is still loaded anywhere in-process.
+    static func loadedStore(for id: UUID) -> PersistenceController? {
+        registryLock.lock(); defer { registryLock.unlock() }
+        return loadedStores[id]?.value
+    }
+
+    /// Detach the persistent store from its coordinator and flush the WAL, releasing
+    /// the file lock so the SQLite files can be safely deleted. Idempotent.
+    func detach() {
+        if let store = container.persistentStoreCoordinator.persistentStores.first {
+            try? container.persistentStoreCoordinator.remove(store)
+        }
+        if let environmentId {
+            PersistenceController.registryLock.lock()
+            PersistenceController.loadedStores.removeValue(forKey: environmentId)
+            PersistenceController.registryLock.unlock()
+        }
+    }
 
     /// Delete the SQLite store files for an environment (called on environment deletion).
-    static func wipeEnvironment(id: UUID) {
+    /// S5: throws on failure so the deletion path can refuse to drop the registry
+    /// entry while data is still (partially) on disk. Detach the coordinator first.
+    static func wipeEnvironment(id: UUID) throws {
         let envDir   = PersistenceController.environmentsDirectory
         let storeURL = envDir.appendingPathComponent("\(id.uuidString).sqlite")
         for ext in ["", "-wal", "-shm"] {
             let path = storeURL.path + ext
             if FileManager.default.fileExists(atPath: path) {
-                try? FileManager.default.removeItem(atPath: path)
+                try FileManager.default.removeItem(atPath: path)
             }
         }
     }
@@ -263,14 +381,17 @@ final class PersistenceController: Sendable {
         let now = Date().timeIntervalSince1970
         guard now - ud.double(forKey: lastPurgeKey) > 86_400 else { return }
 
-        let yesterday = Date().addingTimeInterval(-86_400)
-        let purgeReq  = NSPersistentHistoryChangeRequest.deleteHistory(before: yesterday)
-        let bgCtx     = container.newBackgroundContext()
+        let yesterday   = Date().addingTimeInterval(-86_400)
+        let logFileName = storeURL.lastPathComponent
+        let bgCtx       = container.newBackgroundContext()
         bgCtx.perform {
+            // Build the request and touch UserDefaults inside the closure so no
+            // non-Sendable value is captured across the @Sendable boundary.
+            let purgeReq = NSPersistentHistoryChangeRequest.deleteHistory(before: yesterday)
             do {
                 try bgCtx.execute(purgeReq)
-                ud.set(now, forKey: lastPurgeKey)
-                os_log(.debug, "[CoreData] Persistent history purged for %{public}@.", storeURL.lastPathComponent)
+                UserDefaults.standard.set(now, forKey: lastPurgeKey)
+                os_log(.debug, "[CoreData] Persistent history purged for %{public}@.", logFileName)
             } catch {
                 os_log(.error, "[CoreData] History purge error: %{public}@", error.localizedDescription)
             }
@@ -281,17 +402,31 @@ final class PersistenceController: Sendable {
     // without crossing actor boundaries. The caller (AppStore, which IS @MainActor)
     // can forward errors to LogService after the call returns.
 
-    func save() {
+    /// S7: returns whether the save succeeded (or was a no-op). Still logs on failure.
+    @discardableResult
+    func save() -> Bool {
         let ctx = container.viewContext
-        guard ctx.hasChanges else { return }
-        do   { try ctx.save() }
-        catch { os_log(.error, "[CoreData] view-context save error: %{public}@", error.localizedDescription) }
+        guard ctx.hasChanges else { return true }
+        do   { try ctx.save(); return true }
+        catch { os_log(.error, "[CoreData] view-context save error: %{public}@", error.localizedDescription); return false }
     }
 
-    func save(_ ctx: NSManagedObjectContext) {
+    /// S7: returns whether the save succeeded (or was a no-op). Callers that persist
+    /// sync results (AppStore.upsertDevices) MUST check this — a swallowed failure
+    /// here is exactly how a partial run used to report success.
+    @discardableResult
+    func save(_ ctx: NSManagedObjectContext) -> Bool {
+        guard ctx.hasChanges else { return true }
+        do   { try ctx.save(); return true }
+        catch { os_log(.error, "[CoreData] background-context save error: %{public}@", error.localizedDescription); return false }
+    }
+
+    /// S3: throwing counterpart of `save(_:)`. The resume-cursor checkpoint path
+    /// advances the cursor only after this returns without throwing, so a failed
+    /// batch commit can never leave the cursor ahead of the data on disk.
+    func saveOrThrow(_ ctx: NSManagedObjectContext) throws {
         guard ctx.hasChanges else { return }
-        do   { try ctx.save() }
-        catch { os_log(.error, "[CoreData] background-context save error: %{public}@", error.localizedDescription) }
+        try ctx.save()
     }
 
     // MARK: - Batch delete (cache wipe)
@@ -349,6 +484,38 @@ final class PersistenceController: Sendable {
                 os_log(.error, "[CoreData] VACUUM store cycle error: %{public}@", error.localizedDescription)
             }
         }
+    }
+
+    // MARK: - S2: Jamf mapping revalidation gate
+    /// Mark every device that carries a Jamf-ID mapping as pending revalidation.
+    /// Called by AppStore.saveJamfCredentials() the instant the Jamf URL/clientId
+    /// changes — until each serial is re-matched against the newly configured host,
+    /// write-back must not PATCH by the (now untrusted) cached jamfId.
+    /// One NSBatchUpdateRequest; changes are merged straight into viewContext.
+    func markJamfMappingsPendingRevalidation() async {
+        let container = self.container
+        let viewCtx   = container.viewContext
+        let bgCtx     = container.newBackgroundContext()
+        bgCtx.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        await bgCtx.perform {
+            let req = NSBatchUpdateRequest(entityName: "CDDevice")
+            req.predicate = NSPredicate(format: "jamfId != nil")
+            req.propertiesToUpdate = [
+                "jamfValidationStatus": JamfValidationStatus.pendingRevalidation.rawValue
+            ]
+            req.resultType = .updatedObjectIDsResultType
+            do {
+                let result = try bgCtx.execute(req) as? NSBatchUpdateResult
+                let ids    = result?.result as? [NSManagedObjectID] ?? []
+                NSManagedObjectContext.mergeChanges(
+                    fromRemoteContextSave: [NSUpdatedObjectsKey: ids],
+                    into: [viewCtx])
+                os_log(.default, "[CoreData] S2: %d device mapping(s) marked pendingRevalidation.", ids.count)
+            } catch {
+                os_log(.error, "[CoreData] S2 batch update error: %{public}@", error.localizedDescription)
+            }
+        }
+        viewCtx.refreshAllObjects()
     }
 }
 
@@ -409,7 +576,9 @@ extension CDDevice {
         }
     }
 
-    private static let iso: ISO8601DateFormatter = {
+    // ISO8601DateFormatter is not Sendable-audited by Apple — nonisolated(unsafe) per
+    // the ARCHITECTURE.md "Swift 6 concurrency" rule (the formatter is only read).
+    nonisolated(unsafe) private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
@@ -418,7 +587,7 @@ extension CDDevice {
     // P3: Second static for the non-fractional fallback (Jamf dates without milliseconds).
     // Previously this was allocated fresh on every parseISO call — at 50k devices × 3 date
     // fields = 150k allocations per sync. Static allocation pays once at first use.
-    private static let isoNoFrac: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoNoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
@@ -439,6 +608,7 @@ extension CDDevice {
         axmPurchaseSourceId = d.axmPurchaseSourceId
         axmOrderNumber      = d.axmOrderNumber
         axmOrderDate        = d.axmOrderDate
+        axmAddedToOrgDate   = d.axmAddedToOrgDate
         axmModel            = d.axmModel
         axmDeviceModel      = d.axmDeviceModel
         axmDeviceClass      = d.axmDeviceClass
@@ -461,9 +631,17 @@ extension CDDevice {
         jamfFileVaultStatus = d.jamfFileVaultStatus
         jamfUsername        = d.jamfUsername
         jamfDeviceType      = d.jamfDeviceType
+        jamfProcessorType   = d.jamfProcessorType
+        jamfInitialEntryDate = d.jamfInitialEntryDate
+        jamfRamGB           = d.jamfRamGB
+        // Written to jamfMdmCertExpirationRaw (String), not the legacy jamfMdmCertExpiration
+        // (Date) attribute — see the schema comment on jamfMdmCertExpirationRaw for why.
+        jamfMdmCertExpirationRaw = d.jamfMdmCertExpiration
         assignedMdmServerId   = d.assignedMdmServerId
         assignedMdmServerName = d.assignedMdmServerName
         mdmServerType         = d.mdmServerType
+        jamfValidationStatus     = d.jamfValidationStatus
+        lastValidatedJamfOrigin  = d.lastValidatedJamfOrigin
 
         // Raw Apple API JSON — only overwrite when the incoming value is non-nil
         // so a Jamf-only merge pass doesn't null out previously stored Apple blobs.
@@ -477,6 +655,8 @@ extension CDDevice {
         jamfReportDate       = d.jamfReportDate.flatMap       { parseISO($0) }
         jamfLastContact      = d.jamfLastContact.flatMap      { parseISO($0) }
         jamfLastEnrolled     = d.jamfLastEnrolled.flatMap     { parseISO($0) }
+        // Legacy jamfMdmCertExpiration (Date) attribute is intentionally never
+        // written to anymore — see jamfMdmCertExpirationRaw above and its schema comment.
     }
 
     func toDevice() -> Device {
@@ -492,6 +672,7 @@ extension CDDevice {
             axmPurchaseSourceId:  axmPurchaseSourceId,
             axmOrderNumber:       axmOrderNumber,
             axmOrderDate:         axmOrderDate,
+            axmAddedToOrgDate:    axmAddedToOrgDate,
             axmModel:             axmModel,
             axmDeviceModel:       axmDeviceModel,
             axmDeviceClass:       axmDeviceClass,
@@ -512,6 +693,10 @@ extension CDDevice {
             jamfReportDate:       fmt(jamfReportDate),
             jamfLastContact:      fmt(jamfLastContact),
             jamfLastEnrolled:     fmt(jamfLastEnrolled),
+            jamfMdmCertExpiration: jamfMdmCertExpirationRaw,
+            jamfInitialEntryDate: jamfInitialEntryDate,
+            jamfProcessorType:    jamfProcessorType,
+            jamfRamGB:            jamfRamGB,
             jamfWarrantyDate:     jamfWarrantyDate,
             jamfVendor:           jamfVendor,
             jamfAppleCareId:      jamfAppleCareId,
@@ -522,6 +707,8 @@ extension CDDevice {
             assignedMdmServerId:  assignedMdmServerId,
             assignedMdmServerName: assignedMdmServerName,
             mdmServerType:        mdmServerType,
+            jamfValidationStatus:   jamfValidationStatus,
+            lastValidatedJamfOrigin: lastValidatedJamfOrigin,
             axmRawJson:           axmRawJson,
             axmCoverageRawJson:   axmCoverageRawJson
         )

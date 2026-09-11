@@ -14,6 +14,7 @@
 
 import Foundation
 import Security
+import CryptoKit
 
 enum KeychainService {
 
@@ -298,17 +299,84 @@ enum KeychainService {
         delete(for: tokenExpiryKey(for: scope))
     }
 
-    /// Clear the AxM token for a specific environment.
+    // MARK: - S1: Environment + identity-scoped access tokens
+    //
+    // A cached token is bound to four things: the environment UUID (key namespace),
+    // the provider and — for Apple — the scope (key path: service.abm.{business|school}
+    // / service.jamf), and an origin+clientId fingerprint stored alongside it. loadX
+    // returns nil unless the caller's fingerprint matches, so a token cached for one
+    // environment / host / client can never be handed to a service built for a
+    // different one. See ARCHITECTURE.md "Token cache is environment + identity scoped".
+
+    /// SHA-256 hex of "origin\nclientId" — the identity a cached token is bound to.
+    static func tokenIdentity(origin: String, clientId: String) -> String {
+        let digest = SHA256.hash(data: Data("\(origin.lowercased())\n\(clientId)".utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func abmTokenBase(for scope: AxMScope) -> String {
+        "service.abm.\(scope == .school ? "school" : "business")"
+    }
+
+    static func saveAxMTokenForEnv(_ token: String, expiry: Date, identity: String,
+                                   scope: AxMScope, envId: UUID) {
+        let base = abmTokenBase(for: scope)
+        saveForEnv(token,                                 key: "\(base).accessToken",       envId: envId)
+        saveForEnv(String(expiry.timeIntervalSince1970), key: "\(base).accessTokenExpiry", envId: envId)
+        saveForEnv(identity,                              key: "\(base).tokenIdentity",     envId: envId)
+    }
+
+    /// Returns a cached Apple token only when its stored identity matches `identity`
+    /// and more than 300s remain (mirrors ABMService.validToken()'s reuse guard).
+    static func loadAxMTokenForEnv(identity: String, scope: AxMScope, envId: UUID) -> (token: String, expiry: Date)? {
+        let base = abmTokenBase(for: scope)
+        guard let token  = loadForEnv(key: "\(base).accessToken", envId: envId), !token.isEmpty,
+              let stored = loadForEnv(key: "\(base).tokenIdentity", envId: envId), stored == identity,
+              let expStr = loadForEnv(key: "\(base).accessTokenExpiry", envId: envId),
+              let epoch  = Double(expStr) else { return nil }
+        let expiry = Date(timeIntervalSince1970: epoch)
+        guard expiry.timeIntervalSinceNow > 300 else { return nil }
+        return (token, expiry)
+    }
+
+    static func clearAxMTokenForEnv(scope: AxMScope, envId: UUID) {
+        let base = abmTokenBase(for: scope)
+        deleteForEnv(key: "\(base).accessToken",       envId: envId)
+        deleteForEnv(key: "\(base).accessTokenExpiry", envId: envId)
+        deleteForEnv(key: "\(base).tokenIdentity",     envId: envId)
+    }
+
+    static func saveJamfTokenForEnv(_ token: String, expiry: Date, ttl: Int,
+                                    identity: String, envId: UUID) {
+        saveForEnv(token,                                 key: "service.jamf.accessToken",       envId: envId)
+        saveForEnv(String(expiry.timeIntervalSince1970), key: "service.jamf.accessTokenExpiry", envId: envId)
+        saveForEnv(String(ttl),                           key: "service.jamf.tokenTTL",          envId: envId)
+        saveForEnv(identity,                              key: "service.jamf.tokenIdentity",     envId: envId)
+    }
+
+    static func loadJamfTokenForEnv(identity: String, envId: UUID) -> (token: String, expiry: Date, ttl: Int)? {
+        guard let token  = loadForEnv(key: "service.jamf.accessToken", envId: envId), !token.isEmpty,
+              let stored = loadForEnv(key: "service.jamf.tokenIdentity", envId: envId), stored == identity,
+              let expStr = loadForEnv(key: "service.jamf.accessTokenExpiry", envId: envId),
+              let epoch  = Double(expStr) else { return nil }
+        let expiry = Date(timeIntervalSince1970: epoch)
+        guard expiry.timeIntervalSinceNow > 0 else { return nil }
+        let ttl = loadForEnv(key: "service.jamf.tokenTTL", envId: envId).flatMap { Int($0) } ?? 1800
+        return (token, expiry, ttl)
+    }
+
+    /// Clear the AxM token for one scope within an environment.
     static func clearAxMTokenForEnv(id: UUID) {
-        deleteForEnv(key: "axm.accessToken",       envId: id)
-        deleteForEnv(key: "axm.accessTokenExpiry", envId: id)
+        clearAxMTokenForEnv(scope: .business, envId: id)
+        clearAxMTokenForEnv(scope: .school,   envId: id)
     }
 
     /// Clear the Jamf token for a specific environment.
     static func clearJamfTokenForEnv(id: UUID) {
-        deleteForEnv(key: "jamf.accessToken",       envId: id)
-        deleteForEnv(key: "jamf.accessTokenExpiry", envId: id)
-        deleteForEnv(key: "jamf.tokenTTL",          envId: id)
+        deleteForEnv(key: "service.jamf.accessToken",       envId: id)
+        deleteForEnv(key: "service.jamf.accessTokenExpiry", envId: id)
+        deleteForEnv(key: "service.jamf.tokenTTL",          envId: id)
+        deleteForEnv(key: "service.jamf.tokenIdentity",     envId: id)
     }
 
     // MARK: - Jamf access token persistence (S2)
@@ -460,18 +528,37 @@ enum KeychainService {
     // MARK: - v2.0 Migration: copy v1 flat keys into env namespace
 
     /// Step 1 of migration: copy v1 flat Keychain credentials to env-namespaced keys.
-    /// v1 flat keys are NOT deleted here — call deleteV1KeychainKeys() only after
-    /// the entire migration (CoreData + UserDefaults) completes successfully.
-    static func migrateToEnvironment(id: UUID, scope: AxMScope) {
+    /// Every value that exists in v1 is written AND read back byte-for-byte to confirm
+    /// it round-trips (values are never logged). v1 flat keys are NOT deleted here —
+    /// call deleteV1KeychainKeys() only after the entire migration (CoreData +
+    /// UserDefaults) completes and verifies successfully.
+    /// A v1 install with no credentials configured is a valid `.success` (nothing to copy).
+    static func migrateToEnvironment(id: UUID, scope: AxMScope) -> Result<Void, MigrationError> {
         let s = scope == .school ? "school" : "business"
-        if let v = load(for: scope == .school ? .axmSchoolClientId  : .axmBizClientId),  !v.isEmpty { saveForEnv(v, key: "axm.\(s).clientId",          envId: id) }
-        if let v = load(for: scope == .school ? .axmSchoolKeyId     : .axmBizKeyId),     !v.isEmpty { saveForEnv(v, key: "axm.\(s).keyId",             envId: id) }
-        if let v = load(for: scope == .school ? .axmSchoolPrivateKey : .axmBizPrivateKey),!v.isEmpty { saveForEnv(v, key: "axm.\(s).privateKeyContent", envId: id) }
-        if let v = load(for: .jamfURL),          !v.isEmpty { saveForEnv(v, key: "jamf.url",          envId: id) }
-        if let v = load(for: .jamfClientId),     !v.isEmpty { saveForEnv(v, key: "jamf.clientId",     envId: id) }
-        if let v = load(for: .jamfClientSecret), !v.isEmpty { saveForEnv(v, key: "jamf.clientSecret", envId: id) }
-        if let v = load(for: .jamfPageSize),     !v.isEmpty { saveForEnv(v, key: "jamf.pageSize",     envId: id) }
-        saveForEnv(scope.rawValue, key: "axm.scope", envId: id)
+        // (v1 flat key, env-namespaced key) — only entries actually present in v1 are copied.
+        let pairs: [(Key, String)] = [
+            (scope == .school ? .axmSchoolClientId   : .axmBizClientId,   "axm.\(s).clientId"),
+            (scope == .school ? .axmSchoolKeyId      : .axmBizKeyId,      "axm.\(s).keyId"),
+            (scope == .school ? .axmSchoolPrivateKey : .axmBizPrivateKey, "axm.\(s).privateKeyContent"),
+            (.jamfURL,          "jamf.url"),
+            (.jamfClientId,     "jamf.clientId"),
+            (.jamfClientSecret, "jamf.clientSecret"),
+            (.jamfPageSize,     "jamf.pageSize"),
+        ]
+        for (flatKey, envKey) in pairs {
+            guard let value = load(for: flatKey), !value.isEmpty else { continue }  // not configured in v1
+            guard saveForEnv(value, key: envKey, envId: id) else {
+                return .failure(.keychainCopyFailed(envKey))
+            }
+            guard loadForEnv(key: envKey, envId: id) == value else {
+                return .failure(.keychainVerifyFailed(envKey))
+            }
+        }
+        guard saveForEnv(scope.rawValue, key: "axm.scope", envId: id),
+              loadForEnv(key: "axm.scope", envId: id) == scope.rawValue else {
+            return .failure(.keychainVerifyFailed("axm.scope"))
+        }
+        return .success(())
     }
 
     /// Step 2 of migration: delete v1 flat keys after full migration completes.

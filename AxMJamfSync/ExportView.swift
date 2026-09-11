@@ -338,7 +338,7 @@ struct ExportResultBanner: View {
 
 // MARK: - FileDocument
 struct CSVDocument: FileDocument {
-    static var readableContentTypes: [UTType] = [.commaSeparatedText]
+    static let readableContentTypes: [UTType] = [.commaSeparatedText]
     private let csvData: Data
     init(csvData: Data) { self.csvData = csvData }
     init(configuration: ReadConfiguration) throws {

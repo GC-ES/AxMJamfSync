@@ -89,7 +89,7 @@ struct AxMCredentialsPanel: View {
     @State private var saveToKeychain = true
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
-    private var scopeFull:   String { store.axmCredentials.scope == .school ? "Apple School Manager (ASM)" : "Apple Business Manager (ABM)" }
+    private var scopeFull:   String { store.axmCredentials.scope.label }
 
     // Locked when credentials are configured OR cache exists.
     // Derived purely from @Published AppStore properties — no Keychain reads in body.
@@ -108,7 +108,7 @@ struct AxMCredentialsPanel: View {
                         title:   "Account Type",
                         summary: "Choose the Apple platform your organisation uses to manage devices.",
                         bullets: [
-                            "Business Manager (ABM) — for companies, enterprises, and government organisations.",
+                            "Business (ABM) — for companies, enterprises, and government organisations.",
                             "School Manager (ASM) — for schools and educational institutions.",
                             "This controls which Apple servers the app connects to when fetching device and warranty data."
                         ]

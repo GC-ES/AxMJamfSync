@@ -21,6 +21,13 @@ enum PrefKey {
     static let alwaysRefreshDevices   = "alwaysRefreshDevices"
     static let alwaysRefreshCoverage  = "alwaysRefreshCoverage"
     static let skipExistingCoverage   = "skipExistingCoverage"
+    // S2: one-shot flag — a full Jamf inventory re-fetch is pending because the
+    // Jamf connection changed. Consumed and cleared by SyncEngine.run().
+    static let forceFullJamfRefetch   = "forceFullJamfRefetch"
+    // S2: canonical Jamf origin (normalised URL + clientId) the serial→Jamf-ID
+    // mapping in CoreData is currently trusted against. Compared at credential-save
+    // time to detect a rebinding.
+    static let jamfValidatedOrigin    = "jamfValidatedOrigin"
     static let lastAxmSyncEpoch       = "lastAxmSyncEpoch"
     static let lastJamfSyncEpoch      = "lastJamfSyncEpoch"
     static let lastCoverageSyncEpoch  = "lastCoverageSyncEpoch"
@@ -37,14 +44,20 @@ enum PrefKey {
     static let lrCovFetched           = "lrCovFetched"
     static let lrWBSynced             = "lrWBSynced"
     static let lrWBFailed             = "lrWBFailed"
+    // S7: raw value of the last run's SyncOutcome (success/partial/failed/cancelled).
+    static let lrOutcome              = "lrOutcome"
     static let activeScope            = "activeScope"
     static let dataCachedScope        = "dataCachedScope"
     static let syncDeviceScope        = "syncDeviceScope"
+    static let dashboardFocus         = "dashboardFocus"
     // Cursor resume — saves the last successful cursor + fetched count so a
     // failed mid-fetch can resume from exactly where it stopped on next run.
     static let axmResumeCursor        = "axmResumeCursor"
     static let axmResumedDeviceCount  = "axmResumedDeviceCount"
     static let axmResumeScope         = "axmResumeScope"
+    // S3: credential identity (SHA-256 of origin + clientId) the resume cursor was
+    // written against. A cursor must never be resumed against a different credential.
+    static let axmResumeIdentity      = "axmResumeIdentity"
 }
 
 // MARK: - AppPreferences
@@ -61,13 +74,18 @@ final class AppPreferences: ObservableObject {
     // Namespace prefix — empty string for Default environment (v1 flat keys),
     // "env.{uuid}." for all other environments.
     private let prefix: String
+    private let environmentId: UUID?
+
+    /// S9: this environment's scoped log; the shared singleton for the flat/Default env.
+    var log: LogService { environmentId.map { LogService.makeForEnvironment(id: $0) } ?? .shared }
 
     /// v1-compatible init — uses flat keys, no prefix. Used for Default environment.
-    init() { self.prefix = "" }
+    init() { self.prefix = ""; self.environmentId = nil }
 
     /// Per-environment init — all keys namespaced as "env.{uuid}.{key}".
     init(environmentId: UUID) {
         self.prefix = "env.\(environmentId.uuidString)."
+        self.environmentId = environmentId
     }
 
     // MARK: - Helpers
@@ -108,6 +126,22 @@ final class AppPreferences: ObservableObject {
     var skipExistingCoverage: Bool {
         get { bool(PrefKey.skipExistingCoverage, default: true) }
         set { ud.set(newValue, forKey: k(PrefKey.skipExistingCoverage)); objectWillChange.send() }
+    }
+
+    // MARK: - S2: Jamf connection rebinding guard
+    /// One-shot — set by EnvironmentStore when the Jamf URL/clientId changes so the
+    /// next queued sync does a full Jamf inventory re-fetch (rebuilding the
+    /// serial→Jamf-ID map). SyncEngine.run() reads and clears it, like alwaysRefreshDevices.
+    var forceFullJamfRefetch: Bool {
+        get { bool(PrefKey.forceFullJamfRefetch, default: false) }
+        set { ud.set(newValue, forKey: k(PrefKey.forceFullJamfRefetch)); objectWillChange.send() }
+    }
+    /// The canonical Jamf origin (JamfCredentials.canonicalOrigin) that the cached
+    /// serial→Jamf-ID mapping is currently trusted against. Seeded from Keychain on
+    /// first launch; updated by AppStore.saveJamfCredentials() when the connection changes.
+    var jamfValidatedOrigin: String {
+        get { string(PrefKey.jamfValidatedOrigin, default: "") }
+        set { ud.set(newValue, forKey: k(PrefKey.jamfValidatedOrigin)); objectWillChange.send() }
     }
 
     // MARK: - Last-sync timestamps (stored as Unix epoch Double)
@@ -200,6 +234,10 @@ final class AppPreferences: ObservableObject {
         get { int(PrefKey.lrWBFailed, default: 0) }
         set { ud.set(newValue, forKey: k(PrefKey.lrWBFailed)); objectWillChange.send() }
     }
+    var lrOutcome: String {
+        get { string(PrefKey.lrOutcome, default: SyncOutcome.success.rawValue) }
+        set { ud.set(newValue, forKey: k(PrefKey.lrOutcome)); objectWillChange.send() }
+    }
 
     // MARK: - Scope persistence (survives relaunch)
     // Stores "business" or "school". Saved on every sync + credential save.
@@ -248,10 +286,18 @@ final class AppPreferences: ObservableObject {
         get { string(PrefKey.axmResumeScope, default: "") }
         set { ud.set(newValue, forKey: k(PrefKey.axmResumeScope)) }
     }
+    /// S3: credential identity the resume cursor was written against. Empty for a
+    /// cursor written by a version that predates this key — treated as "matches"
+    /// so an in-flight resume from an older build is not discarded on upgrade.
+    var axmResumeIdentity: String {
+        get { string(PrefKey.axmResumeIdentity, default: "") }
+        set { ud.set(newValue, forKey: k(PrefKey.axmResumeIdentity)) }
+    }
     func clearAxmResumeCursor() {
         ud.removeObject(forKey: k(PrefKey.axmResumeCursor))
         ud.removeObject(forKey: k(PrefKey.axmResumedDeviceCount))
         ud.removeObject(forKey: k(PrefKey.axmResumeScope))
+        ud.removeObject(forKey: k(PrefKey.axmResumeIdentity))
     }
 
     // MARK: - Device scope (which device types to sync)
@@ -262,6 +308,15 @@ final class AppPreferences: ObservableObject {
             SyncDeviceScope(rawValue: ud.string(forKey: k(PrefKey.syncDeviceScope)) ?? "") ?? .both
         }
         set { ud.set(newValue.rawValue, forKey: k(PrefKey.syncDeviceScope)); objectWillChange.send() }
+    }
+
+    // MARK: - Dashboard focus (which system's data the Dashboard tab shows)
+    // Persisted per environment, same namespacing as everything else in this class.
+    var dashboardFocus: DashboardFocus {
+        get {
+            DashboardFocus(rawValue: ud.string(forKey: k(PrefKey.dashboardFocus)) ?? "") ?? .common
+        }
+        set { ud.set(newValue.rawValue, forKey: k(PrefKey.dashboardFocus)); objectWillChange.send() }
     }
 
     // MARK: - Cache staleness helpers (used by SyncEngine)
@@ -303,6 +358,8 @@ final class AppPreferences: ObservableObject {
             PrefKey.activeScope,
             PrefKey.dataCachedScope,
             PrefKey.syncDeviceScope,
+            PrefKey.dashboardFocus,
+            PrefKey.jamfValidatedOrigin,
         ]
         for key in settingsKeys {
             let envKey = prefix + key
@@ -336,6 +393,7 @@ final class AppPreferences: ObservableObject {
             PrefKey.axmResumeCursor,
             PrefKey.axmResumedDeviceCount,
             PrefKey.axmResumeScope,
+            PrefKey.axmResumeIdentity,
         ]
         for key in timestampKeys {
             let envKey = prefix + key
@@ -361,6 +419,6 @@ final class AppPreferences: ObservableObject {
         lastCoverageEpoch = 0
         clearAxmResumeCursor()
         objectWillChange.send()
-        LogService.shared.info("Preferences: sync timestamps cleared — next sync re-fetches all.")
+        log.info("Preferences: sync timestamps cleared — next sync re-fetches all.")
     }
 }

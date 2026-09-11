@@ -43,6 +43,11 @@ struct SyncView: View {
                         .padding(.horizontal, 24)
                     }
 
+                    if engine.lastRunDate != nil && !engine.isRunning {
+                        SyncOutcomeBanner(engine: engine)
+                            .padding(.horizontal, 24)
+                    }
+
                     if engine.lastRunDate != nil {
                         RichRunSummaryCard(engine: engine)
                             .padding(.horizontal, 24)
@@ -60,6 +65,53 @@ struct SyncView: View {
                 .padding(.horizontal, 24).padding(.vertical, 12)
         }
         .background(.background)
+    }
+}
+
+// MARK: - Sync outcome banner (S7)
+// Shows which of the four outcomes the last run actually produced. A clean success
+// stays deliberately quiet — a single green line, no extra chrome or confirmation —
+// so the healthy path looks exactly as unremarkable as it did before this change.
+struct SyncOutcomeBanner: View {
+    @ObservedObject var engine: SyncEngine
+
+    private var detail: String {
+        switch engine.lastOutcome {
+        case .success:
+            return "\(engine.lastRunWBSynced) write-back(s) synced"
+        case .partial:
+            var bits: [String] = []
+            if engine.lastRunWBFailed > 0 { bits.append("\(engine.lastRunWBFailed) write-back(s) failed") }
+            if bits.isEmpty { bits.append("some data was not fully synced this run") }
+            return bits.joined(separator: " · ") + " — known-good data was kept; re-run to finish"
+        case .failed:
+            return engine.lastError ?? "The run did not complete. Existing data is unchanged."
+        case .cancelled:
+            return "Stopped by you. Devices fetched before stopping were saved."
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: engine.lastOutcome.symbol)
+                .foregroundStyle(engine.lastOutcome.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(engine.lastOutcome.label)
+                    .font(.subheadline).fontWeight(.semibold)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(engine.lastOutcome == .success
+                      ? Color.secondary.opacity(0.08)
+                      : engine.lastOutcome.tint.opacity(0.12))
+        )
     }
 }
 
@@ -190,7 +242,6 @@ private struct RunStatTile: View {
 struct SyncProgressBlock: View {
     @ObservedObject var engine: SyncEngine
     @State private var elapsedSeconds: Int = 0
-    @State private var timer: Timer?
 
 
     var body: some View {
@@ -231,20 +282,16 @@ struct SyncProgressBlock: View {
                 }
             }
         }
-        .onChange(of: engine.isRunning) { _, running in
-            if running {
-                elapsedSeconds = 0
-                timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-                    elapsedSeconds += 1
-                }
-            } else {
-                timer?.invalidate(); timer = nil
+        // Elapsed-time ticker: a MainActor-isolated task, restarted whenever the run
+        // state flips and auto-cancelled on disappear — no escaping Timer to manage.
+        .task(id: engine.isRunning) {
+            guard engine.isRunning else { return }
+            elapsedSeconds = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { break }
+                elapsedSeconds += 1
             }
-        }
-        .onDisappear {
-            // Safety: if the view is removed while a sync is running (tab switch),
-            // invalidate the timer so it does not fire against a deallocated @State.
-            timer?.invalidate(); timer = nil
         }
     }
 

@@ -146,6 +146,10 @@ actor ABMService {
     private let keyId:             String
     private let privateKeyContent: String  // PEM content stored in Keychain — never read from file
     private let scope:             AxMScope // needed for Keychain token persistence
+    private let environmentId:     UUID     // S1: token cache namespace — immutable, passed at init
+    private let tokenIdentity:     String   // S1: SHA-256(origin + clientId) the cached token is bound to
+    // S9: this environment's scoped log — every diagnostic here is about one env's run.
+    private let log: LogService
 
     // MARK: Token cache (within this actor's lifetime)
     private var cachedToken:  String?
@@ -182,18 +186,21 @@ actor ABMService {
 
 
     // MARK: Init
-    init(credentials: AxMCredentials) {
+    init(credentials: AxMCredentials, environmentId: UUID, log: LogService) {
         self.baseURL           = credentials.scope.baseURL
         self.clientId          = credentials.clientId
         self.keyId             = credentials.keyId
         self.privateKeyContent = credentials.privateKeyContent
         self.scope             = credentials.scope
+        self.environmentId     = environmentId
+        self.log               = log
+        self.tokenIdentity     = KeychainService.tokenIdentity(origin: credentials.scope.baseURL,
+                                                               clientId: credentials.clientId)
 
         let scopeLabel = credentials.scope == .school ? "ASM" : "ABM"
 
         // ── Credential diagnostics ────────────────────────────────────────────
         Task { @MainActor in
-            let log = LogService.shared
             let cidStatus = credentials.clientId.isEmpty  ? "missing" : "present"
             let kidStatus = credentials.keyId.isEmpty     ? "missing" : "present"
             log.debug("[\(scopeLabel)] Credentials — clientId: \(cidStatus) keyId: \(kidStatus) scope: \(credentials.scope.rawValue)")
@@ -203,17 +210,17 @@ actor ABMService {
         }
 
         // ── Keychain token check ─────────────────────────────────────────────
-        if let cached = KeychainService.loadAxMToken(for: credentials.scope) {
+        if let cached = KeychainService.loadAxMTokenForEnv(identity: tokenIdentity, scope: credentials.scope, envId: environmentId) {
             self.cachedToken = cached.token
             self.tokenExpiry = cached.expiry
             let remaining = Int(cached.expiry.timeIntervalSinceNow)
             let mins = remaining / 60
             Task { @MainActor in
-                LogService.shared.debug("[\(scopeLabel)] Keychain token: found — expires in \(mins)m (\(remaining)s), will \(remaining > 60 ? "reuse" : "refresh (< 60s remaining)").")
+                log.debug("[\(scopeLabel)] Keychain token: found — expires in \(mins)m (\(remaining)s), will \(remaining > 60 ? "reuse" : "refresh (< 60s remaining)").")
             }
         } else {
             Task { @MainActor in
-                LogService.shared.debug("[\(scopeLabel)] Keychain token: none — will fetch fresh token on first API call.")
+                log.debug("[\(scopeLabel)] Keychain token: none — will fetch fresh token on first API call.")
             }
         }
     }
@@ -223,21 +230,23 @@ actor ABMService {
     /// Mirrors device_sync.py → sync_axm_devices → _paginate_axm(…/v1/orgDevices)
     ///
     /// Option B — Cursor resume + partial dump:
-    ///   - onBatchReady fires every `batchFlushPages` pages with accumulated devices + current
-    ///     cursor. SyncEngine saves them to CoreData immediately and persists the cursor to
-    ///     UserDefaults. On next run SyncEngine passes a resumeCursor to start from that point.
-    ///   - If all retries fail, returns whatever was collected so far (partial results) rather
-    ///     than throwing — cursor was already saved by the last onBatchReady call so resume works.
+    ///   - onBatchReady fires every `batchFlushPages` pages with accumulated devices + the
+    ///     next-page cursor. It MUST durably commit that batch to CoreData and only then
+    ///     advance the resume cursor; if the commit throws, the cursor is not advanced and
+    ///     the error propagates out of this function so the next run replays from the last
+    ///     committed batch (re-upserting a saved batch is idempotent).
+    ///   - If all network retries fail, returns whatever was collected so far (partial
+    ///     results) after flushing + committing the buffered batch first.
     ///   - debugPageLimit: DEBUG ONLY — set to a non-zero value to stop after N devices to test
     ///     cursor resume. Remove / set to 0 in production.
     func fetchOrgDevices(
         pageSize:        Int = 1000,
         resumeCursor:    String? = nil,
         debugPageLimit:  Int = 0,          // DEBUG: stop after this many devices (0 = no limit)
-        batchFlushPages: Int = 10,         // flush to CoreData + save cursor every N pages
-        onProgress:      @MainActor (Int, Int) -> Void,
-        onBatchReady:    @MainActor ([RawABMDevice], String?) -> Void  // (batch, nextCursor)
-    ) async -> [RawABMDevice] {            // returns partial on failure — never throws
+        batchFlushPages: Int = 10,         // commit to CoreData + advance cursor every N pages
+        onProgress:      @Sendable @MainActor (Int, Int) -> Void,
+        onBatchReady:    @Sendable @MainActor ([RawABMDevice], String?) async throws -> Void  // (batch, nextCursor)
+    ) async throws -> [RawABMDevice] {     // partial on network failure; throws only if a batch fails to commit
 
         var results:  [RawABMDevice] = []
         // Start from a saved cursor if resuming, otherwise nil = start from page 1
@@ -250,30 +259,30 @@ actor ABMService {
         var batchAccumulator: [RawABMDevice] = []  // devices since last flush
 
         if let rc = resumeCursor {
-            await LogService.shared.info("[\(scopeLabel)] Resuming org device fetch from saved cursor (\(rc.prefix(20))…)")
+            await log.info("[\(scopeLabel)] Resuming org device fetch from saved cursor (\(rc.prefix(20))…)")
         }
         await onProgress(0, 0)
 
         repeat {
             // Cancellation check — honour Stop Sync between pages
             guard !(Task.isCancelled) else {
-                await LogService.shared.info("[\(scopeLabel)] Fetch cancelled — flushing \(batchAccumulator.count) buffered device(s).")
+                await log.info("[\(scopeLabel)] Fetch cancelled — committing \(batchAccumulator.count) buffered device(s).")
                 if !batchAccumulator.isEmpty {
-                    await onBatchReady(batchAccumulator, cursor)
+                    try await onBatchReady(batchAccumulator, cursor)
                 }
                 return results
             }
 
             // Fix B: per-page token refresh
             guard let token = try? await validToken() else {
-                await LogService.shared.error("[\(scopeLabel)] Token unavailable — stopping fetch with \(results.count) devices collected.")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.error("[\(scopeLabel)] Token unavailable — stopping fetch with \(results.count) devices collected.")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
 
             guard var components = URLComponents(string: baseURL + "/v1/orgDevices") else {
-                await LogService.shared.error("[\(scopeLabel)] Could not build /v1/orgDevices URL.")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.error("[\(scopeLabel)] Could not build /v1/orgDevices URL.")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
             var queryItems: [URLQueryItem] = [
@@ -283,8 +292,8 @@ actor ABMService {
             components.queryItems = queryItems
 
             guard let orgDevicesURL = components.url else {
-                await LogService.shared.error("[\(scopeLabel)] URLComponents produced nil URL.")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.error("[\(scopeLabel)] URLComponents produced nil URL.")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
             var request = URLRequest(url: orgDevicesURL)
@@ -304,7 +313,7 @@ actor ABMService {
             } catch let urlErr as URLError where urlErr.code == .networkConnectionLost
                                                || urlErr.code.rawValue == -1005 {
                 // Attempt 1 — 5s
-                await LogService.shared.warn("[\(scopeLabel)] /v1/orgDevices page \(pageNum): -1005 connection reset — recreating session, waiting 5s, retry 1/2…")
+                await log.warn("[\(scopeLabel)] /v1/orgDevices page \(pageNum): -1005 connection reset — recreating session, waiting 5s, retry 1/2…")
                 resetOrgDeviceSession()
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 do {
@@ -312,41 +321,41 @@ actor ABMService {
                 } catch let retryErr as URLError where retryErr.code == .networkConnectionLost
                                                     || retryErr.code.rawValue == -1005 {
                     // Attempt 2 — 10s
-                    await LogService.shared.warn("[\(scopeLabel)] /v1/orgDevices page \(pageNum): retry 1 failed — waiting 10s, retry 2/2…")
+                    await log.warn("[\(scopeLabel)] /v1/orgDevices page \(pageNum): retry 1 failed — waiting 10s, retry 2/2…")
                     resetOrgDeviceSession()
                     try? await Task.sleep(nanoseconds: 10_000_000_000)
                     do {
                         (data, response) = try await session.data(for: request)
                     } catch {
                         // All retries exhausted — flush what we have, save cursor, return partial
-                        await LogService.shared.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): all retries failed (\(error.localizedDescription)). Flushing \(results.count + batchAccumulator.count) devices and saving cursor for resume.")
-                        if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                        await log.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): all retries failed (\(error.localizedDescription)). Flushing \(results.count + batchAccumulator.count) devices and saving cursor for resume.")
+                        if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                         return results
                     }
                 } catch {
                     // Retry 1 threw a non -1005 error — flush and return partial
-                    await LogService.shared.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): retry 1 non-URL error (\(error.localizedDescription)). Flushing \(results.count + batchAccumulator.count) devices.")
-                    if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                    await log.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): retry 1 non-URL error (\(error.localizedDescription)). Flushing \(results.count + batchAccumulator.count) devices.")
+                    if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                     return results
                 }
             } catch {
                 // Non -1005 error (e.g. 401, timeout) — flush and return partial
-                await LogService.shared.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): unexpected error (\(error.localizedDescription)). Flushing \(results.count + batchAccumulator.count) devices and saving cursor for resume.")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): unexpected error (\(error.localizedDescription)). Flushing \(results.count + batchAccumulator.count) devices and saving cursor for resume.")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
 
             // Validate HTTP status — if Apple returns 400/410 on a stale cursor,
             // the defensive fallback clears the cursor and the caller restarts from page 1.
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                await LogService.shared.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): HTTP \(http.statusCode) — cursor may be stale. Flushing \(results.count + batchAccumulator.count) devices.")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): HTTP \(http.statusCode) — cursor may be stale. Flushing \(results.count + batchAccumulator.count) devices.")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
 
             guard let decoded = try? decoder.decode(ABMDeviceListResponse.self, from: data) else {
-                await LogService.shared.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): JSON decode failed. Returning \(results.count) devices.")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.error("[\(scopeLabel)] /v1/orgDevices page \(pageNum): JSON decode failed. Returning \(results.count) devices.")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
 
@@ -358,6 +367,12 @@ actor ABMService {
                 let orderDateStr = record.attributes.orderDateTime.flatMap { s in
                     s.count >= 10 ? String(s.prefix(10)) : nil
                 }
+                // addedToOrgDateTime — unlike orderDateTime (often absent for reseller/manual/
+                // older devices), this is populated for essentially every device, since it's
+                // stamped when Apple adds the device to the org's ABM/ASM roster.
+                let addedToOrgDateStr = record.attributes.addedToOrgDateTime.flatMap { s in
+                    s.count >= 10 ? String(s.prefix(10)) : nil
+                }
                 let device = RawABMDevice(
                     deviceId:           record.id,
                     serialNumber:       serial,
@@ -366,6 +381,7 @@ actor ABMService {
                     purchaseSourceId:   record.attributes.purchaseSourceId,
                     orderNumber:        record.attributes.orderNumber,
                     orderDate:          orderDateStr,
+                    addedToOrgDate:     addedToOrgDateStr,
                     productDescription: record.attributes.productDescription,
                     deviceModel:        record.attributes.deviceModel,
                     deviceClass:        record.attributes.deviceClass,
@@ -381,12 +397,13 @@ actor ABMService {
 
             await onProgress(results.count, results.count)
 
-            // ── Flush batch every N pages ────────────────────────────────────
-            // Saves devices to CoreData + persists cursor to UserDefaults so any
-            // failure after this point can resume from the next cursor.
+            // ── Commit batch every N pages ───────────────────────────────────
+            // onBatchReady writes these devices to CoreData and only then advances
+            // the resume cursor to `cursor`. A throw here (commit failed) propagates
+            // out of fetchOrgDevices without advancing the cursor.
             if pageCount % batchFlushPages == 0 {
-                await LogService.shared.info("[\(scopeLabel)] Batch flush: \(batchAccumulator.count) devices (total \(results.count)) — cursor saved for resume.")
-                await onBatchReady(batchAccumulator, cursor)
+                await log.info("[\(scopeLabel)] Batch commit: \(batchAccumulator.count) devices (total \(results.count)).")
+                try await onBatchReady(batchAccumulator, cursor)
                 batchAccumulator.removeAll()
             }
 
@@ -394,8 +411,8 @@ actor ABMService {
             // Set debugPageLimit > 0 to stop early and test cursor resume.
             // REMOVE or leave as 0 in production.
             if debugPageLimit > 0 && results.count >= debugPageLimit {
-                await LogService.shared.info("[\(scopeLabel)] DEBUG: debugPageLimit \(debugPageLimit) reached at \(results.count) devices — stopping to test cursor resume. cursor=\(cursor?.prefix(30) ?? "nil")")
-                if !batchAccumulator.isEmpty { await onBatchReady(batchAccumulator, cursor) }
+                await log.info("[\(scopeLabel)] DEBUG: debugPageLimit \(debugPageLimit) reached at \(results.count) devices — stopping to test cursor resume. cursor=\(cursor?.prefix(30) ?? "nil")")
+                if !batchAccumulator.isEmpty { try await onBatchReady(batchAccumulator, cursor) }
                 return results
             }
 
@@ -405,11 +422,11 @@ actor ABMService {
         // Flush any remaining devices in the accumulator, then signal completion
         // with cursor=nil so SyncEngine clears the saved resume cursor.
         if !batchAccumulator.isEmpty {
-            await LogService.shared.info("[\(scopeLabel)] Final flush: \(batchAccumulator.count) device(s) (total \(results.count)).")
-            await onBatchReady(batchAccumulator, nil)  // nil cursor = fetch complete
+            await log.info("[\(scopeLabel)] Final commit: \(batchAccumulator.count) device(s) (total \(results.count)).")
+            try await onBatchReady(batchAccumulator, nil)  // nil cursor = fetch complete
         } else {
             // No leftover batch — still signal completion so cursor gets cleared
-            await onBatchReady([], nil)
+            try await onBatchReady([], nil)
         }
 
         return results
@@ -476,7 +493,7 @@ actor ABMService {
 
         repeat {
             guard let token = try? await validToken() else {
-                await LogService.shared.error("[\(scopeLabel)] MDM servers: token unavailable.")
+                await log.error("[\(scopeLabel)] MDM servers: token unavailable.")
                 return results
             }
             guard var components = URLComponents(string: baseURL + "/v1/mdmServers") else {
@@ -494,11 +511,11 @@ actor ABMService {
             guard let (data, response) = try? await session.data(for: request),
                   let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode) else {
-                await LogService.shared.warn("[\(scopeLabel)] MDM servers: HTTP error — skipping.")
+                await log.warn("[\(scopeLabel)] MDM servers: HTTP error — skipping.")
                 return results
             }
             guard let decoded = try? JSONDecoder().decode(ABMMdmServerListResponse.self, from: data) else {
-                await LogService.shared.warn("[\(scopeLabel)] MDM servers: JSON decode failed.")
+                await log.warn("[\(scopeLabel)] MDM servers: JSON decode failed.")
                 return results
             }
             for record in decoded.data {
@@ -511,7 +528,7 @@ actor ABMService {
             cursor = decoded.meta?.paging?.nextCursor
         } while cursor != nil
 
-        await LogService.shared.info("[\(scopeLabel)] MDM servers: fetched \(results.count) server(s).")
+        await log.info("[\(scopeLabel)] MDM servers: fetched \(results.count) server(s).")
         return results
     }
 
@@ -539,7 +556,7 @@ actor ABMService {
             guard let (data, response) = try? await session.data(for: request),
                   let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode) else {
-                await LogService.shared.warn("[\(scopeLabel)] MDM server \(serverId.prefix(8)): HTTP error fetching devices.")
+                await log.warn("[\(scopeLabel)] MDM server \(serverId.prefix(8)): HTTP error fetching devices.")
                 return serials
             }
             guard let decoded = try? JSONDecoder().decode(ABMMdmDeviceLinkResponse.self, from: data) else {
@@ -567,10 +584,17 @@ actor ABMService {
         let scopeLabel = scope == .school ? "ASM" : "ABM"
         cachedToken = nil
         tokenExpiry = .distantPast
-        KeychainService.clearAxMToken(for: scope)
+        KeychainService.clearAxMTokenForEnv(scope: scope, envId: environmentId)
         Task { @MainActor in
-            LogService.shared.debug("[\(scopeLabel)] Token: cleared from memory and Keychain (post-401 eviction).")
+            log.debug("[\(scopeLabel)] Token: cleared from memory and Keychain (post-401 eviction).")
         }
+    }
+
+    /// S1: force a fresh token round-trip against the supplied credential identity.
+    /// Never reads or writes the cache — used only by Setup's Test action so a stale
+    /// cached token can't report success for credentials that are actually wrong.
+    func verifyCredentials() async throws {
+        _ = try await fetchToken()
     }
 
     func validToken() async throws -> String {
@@ -580,20 +604,20 @@ actor ABMService {
         // trigger a new fetch on every run, hitting Apple's per-client-id rate limit.
         if let t = cachedToken, Date() < tokenExpiry.addingTimeInterval(-300) {
             let remaining = Int(tokenExpiry.timeIntervalSinceNow)
-            await LogService.shared.debug("[\(scopeLabel)] Token: reusing cached token — \(remaining / 60)m \(remaining % 60)s remaining.")
+            await log.debug("[\(scopeLabel)] Token: reusing cached token — \(remaining / 60)m \(remaining % 60)s remaining.")
             return t
         }
         let remaining = Int(tokenExpiry.timeIntervalSinceNow)
         if remaining > 0 {
-            await LogService.shared.debug("[\(scopeLabel)] Token: cached token has only \(remaining)s left — fetching fresh token.")
+            await log.debug("[\(scopeLabel)] Token: cached token has only \(remaining)s left — fetching fresh token.")
         } else {
-            await LogService.shared.debug("[\(scopeLabel)] Token: no valid cached token — fetching fresh token from Apple token endpoint…")
+            await log.debug("[\(scopeLabel)] Token: no valid cached token — fetching fresh token from Apple token endpoint…")
         }
         let (token, ttl) = try await fetchToken()
         cachedToken = token
         tokenExpiry = Date().addingTimeInterval(TimeInterval(ttl))
-        await LogService.shared.debug("[\(scopeLabel)] Token: received — TTL \(ttl)s (\(ttl / 60)m). Saving to Keychain.")
-        KeychainService.saveAxMToken(token, expiry: tokenExpiry, for: scope)
+        await log.debug("[\(scopeLabel)] Token: received — TTL \(ttl)s (\(ttl / 60)m). Saving to Keychain.")
+        KeychainService.saveAxMTokenForEnv(token, expiry: tokenExpiry, identity: tokenIdentity, scope: scope, envId: environmentId)
         return token
     }
 
@@ -634,12 +658,12 @@ actor ABMService {
             if http.statusCode == 400 {
                 // Do not log response body — Apple's 400 can echo back the client_assertion JWT
                 // which contains the clientId. Log the status only.
-                await LogService.shared.error("[\(scopeLabel)] Token endpoint HTTP 400 — bad request. Check clientId/keyId/scope in Setup.")
+                await log.error("[\(scopeLabel)] Token endpoint HTTP 400 — bad request. Check clientId/keyId/scope in Setup.")
                 throw ABMError.authError("HTTP 400 — check clientId/keyId/scope")
             }
             if http.statusCode == 401 {
                 // Do not log response body — may contain echoed client_assertion fragments.
-                await LogService.shared.error("[\(scopeLabel)] Token endpoint HTTP 401 — client assertion rejected. Check private key matches keyId in Setup.")
+                await log.error("[\(scopeLabel)] Token endpoint HTTP 401 — client assertion rejected. Check private key matches keyId in Setup.")
                 throw ABMError.authError("HTTP 401 — client assertion rejected; check private key and keyId")
             }
             if http.statusCode == 429 {
@@ -659,22 +683,22 @@ actor ABMService {
                 } else {
                     retryAfter = 30   // conservative default
                 }
-                await LogService.shared.warn("[\(scopeLabel)] Token endpoint HTTP 429 — rate limited. Waiting \(Int(retryAfter))s then retrying once…")
+                await log.warn("[\(scopeLabel)] Token endpoint HTTP 429 — rate limited. Waiting \(Int(retryAfter))s then retrying once…")
                 try await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))
                 // Single retry after backoff
                 let (retryData, retryResponse) = try await session.data(for: request)
                 if let retryHTTP = retryResponse as? HTTPURLResponse, retryHTTP.statusCode == 429 {
-                    await LogService.shared.error("[\(scopeLabel)] Token endpoint still 429 after retry. Wait a few minutes and try again.")
+                    await log.error("[\(scopeLabel)] Token endpoint still 429 after retry. Wait a few minutes and try again.")
                     throw ABMError.authError("HTTP 429 — token endpoint still rate-limited after \(Int(retryAfter))s backoff. Wait a few minutes and try again.")
                 }
                 try validateHTTP(retryResponse, context: "ABM token endpoint (retry)")
                 let retryDecoded = try JSONDecoder().decode(ABMTokenResponse.self, from: retryData)
-                await LogService.shared.info("[\(scopeLabel)] Token endpoint retry succeeded after \(Int(retryAfter))s backoff.")
+                await log.info("[\(scopeLabel)] Token endpoint retry succeeded after \(Int(retryAfter))s backoff.")
                 return (retryDecoded.access_token, retryDecoded.expires_in)
             }
             if !(200..<300).contains(http.statusCode) {
                 // Do not log response body — token endpoint errors may echo credential fragments.
-                await LogService.shared.error("[\(scopeLabel)] Token endpoint HTTP \(http.statusCode) — check credentials in Setup.")
+                await log.error("[\(scopeLabel)] Token endpoint HTTP \(http.statusCode) — check credentials in Setup.")
             }
         }
         try validateHTTP(response, context: "ABM token endpoint")
@@ -790,11 +814,11 @@ actor ABMService {
     /// echoed credential fragments (client_assertion, clientId) from the token endpoint.
     func validateHTTP(_ response: URLResponse, data: Data, context: String) async throws {
         guard let http = response as? HTTPURLResponse else {
-            await LogService.shared.error("[\(context)] No HTTP response received.")
+            await log.error("[\(context)] No HTTP response received.")
             throw ABMError.networkError("\(context): no HTTP response")
         }
         guard (200..<300).contains(http.statusCode) else {
-            await LogService.shared.error("[\(context)] HTTP \(http.statusCode).")
+            await log.error("[\(context)] HTTP \(http.statusCode).")
             throw ABMError.httpError(context: context, statusCode: http.statusCode)
         }
     }
@@ -816,6 +840,7 @@ struct RawABMDevice: Sendable {
     let purchaseSourceId:   String?   // purchaseSourceId
     let orderNumber:        String?   // orderNumber
     let orderDate:          String?   // orderDateTime → YYYY-MM-DD
+    let addedToOrgDate:     String?   // addedToOrgDateTime → YYYY-MM-DD
     let productDescription: String?  // productDescription e.g. "MacBook Pro (16-inch, 2021)"
     let deviceModel:        String?  // deviceModel e.g. "MacBook Pro 13\""
     let deviceClass:        String?

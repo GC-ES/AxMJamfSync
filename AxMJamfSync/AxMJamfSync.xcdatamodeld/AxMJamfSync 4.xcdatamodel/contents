@@ -15,6 +15,10 @@
         <attribute name="axmDeviceStatus"      optional="YES" attributeType="String"/>
         <attribute name="axmDeviceFetchedAt"   optional="YES" attributeType="Date" usesScalarValueType="NO"/>
         <attribute name="axmPurchaseSource"    optional="YES" attributeType="String"/>
+        <attribute name="axmPurchaseSourceId"  optional="YES" attributeType="String"/>   <!-- purchaseSourceId from ABM -->
+        <attribute name="axmOrderNumber"       optional="YES" attributeType="String"/>   <!-- orderNumber from ABM -->
+        <attribute name="axmOrderDate"         optional="YES" attributeType="String"/>   <!-- orderDateTime YYYY-MM-DD from ABM -->
+        <attribute name="axmAddedToOrgDate"    optional="YES" attributeType="String"/>   <!-- addedToOrgDateTime YYYY-MM-DD from ABM — reliably populated, unlike orderDate -->
         <attribute name="axmModel"             optional="YES" attributeType="String"/>
         <attribute name="axmDeviceModel"       optional="YES" attributeType="String"/>
         <attribute name="axmDeviceClass"       optional="YES" attributeType="String"/>
@@ -43,6 +47,11 @@
         <attribute name="jamfReportDate"       optional="YES" attributeType="Date" usesScalarValueType="NO"/>
         <attribute name="jamfLastContact"      optional="YES" attributeType="Date" usesScalarValueType="NO"/>
         <attribute name="jamfLastEnrolled"     optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="jamfMdmCertExpiration" optional="YES" attributeType="Date" usesScalarValueType="NO"/>   <!-- LEGACY — orphaned on purpose, see jamfMdmCertExpirationRaw. Left in place (never written to, never read) purely so its Date type never has to change in-place, which lightweight migration can't infer. Safe to remove entirely in a future version bump that includes a real mapping model. -->
+        <attribute name="jamfMdmCertExpirationRaw" optional="YES" attributeType="String"/>   <!-- general.mdmCertificateExpiration — raw string, not parsed to Date; Jamf doesn't consistently return this in a fractional/plain ISO8601 shape, and formatISO() on the display side already handles multiple formats gracefully -->
+        <attribute name="jamfInitialEntryDate" optional="YES" attributeType="String"/>   <!-- general.initialEntryDate, "YYYY-MM-DD" — shown as "Enrolled Date" -->
+        <attribute name="jamfProcessorType"    optional="YES" attributeType="String"/>   <!-- hardware.processorType -->
+        <attribute name="jamfRamGB"            optional="YES" attributeType="String"/>   <!-- hardware.totalRamMegabytes, pre-converted to whole GB -->
         <attribute name="jamfWarrantyDate"     optional="YES" attributeType="String"/>
         <attribute name="jamfVendor"           optional="YES" attributeType="String"/>
         <attribute name="jamfAppleCareId"      optional="YES" attributeType="String"/>
@@ -50,6 +59,21 @@
         <attribute name="jamfDeviceType"       optional="YES" attributeType="String"/>   <!-- "computer" | "mobile" -->
         <attribute name="jamfFileVaultStatus"  optional="YES" attributeType="String"/>
         <attribute name="jamfUsername"         optional="YES" attributeType="String"/>
+
+        <!-- MDM Server assignment (from /v1/mdmServers/{id}/relationships/devices) -->
+        <attribute name="assignedMdmServerId"   optional="YES" attributeType="String"/>
+        <attribute name="assignedMdmServerName" optional="YES" attributeType="String"/>
+        <attribute name="mdmServerType"         optional="YES" attributeType="String"/>
+
+        <!-- S2: Jamf write-back rebinding guard. Both additive/optional (lightweight migration only).
+             jamfValidationStatus: "validated" | "pendingRevalidation" — nil means a pre-S2 row and is
+             treated as "validated" (pre-fix behaviour assumed the cached serial→jamfId map was always
+             trustworthy). Set to "pendingRevalidation" the moment the Jamf URL/clientId changes, and
+             flipped back to "validated" per-device only when that serial is freshly re-matched against
+             the newly configured host. See ARCHITECTURE.md "Jamf write-back is gated on mapping revalidation". -->
+        <attribute name="jamfValidationStatus"    optional="YES" attributeType="String"/>
+        <attribute name="lastValidatedJamfOrigin" optional="YES" attributeType="String"/>   <!-- canonical Jamf origin (normalised base URL + clientId) the current jamfId mapping was last confirmed against -->
+
 
         <!-- Metadata -->
         <attribute name="createdAt"            optional="NO"  attributeType="Date" usesScalarValueType="NO"/>

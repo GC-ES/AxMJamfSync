@@ -19,13 +19,18 @@ struct AxMDashboardContent: View {
   // filters must compose into drill-downs".
   private func drillDown(axmStatus: String? = nil, productFamily: String? = nil,
                           purchaseSource: String? = nil, addedToOrgYear: String? = nil,
-                          mdmServer: String? = nil, expiringWindow: String? = nil) {
-    store.drillDown(mdmServer: mdmServer ?? store.axmDashboardMdmFacet,
+                          mdmServer: String? = nil, expiringWindow: String? = nil,
+                          mdmMigrationCapable: String? = nil, coverage: CoverageStatus? = nil,
+                          axmMigrationStatus: String? = nil, migrationDeadlineWindow: String? = nil) {
+    store.drillDown(coverage: coverage,
+                     mdmServer: mdmServer ?? store.axmDashboardMdmFacet,
                      axmStatus: axmStatus ?? store.axmDashboardStatusFacet,
                      productFamily: productFamily ?? store.axmDashboardProductFamilyFacet,
                      purchaseSource: purchaseSource ?? store.axmDashboardPurchaseSourceFacet,
                      addedToOrgYear: addedToOrgYear,
-                     expiringWindow: expiringWindow)
+                     expiringWindow: expiringWindow,
+                     mdmMigrationCapable: mdmMigrationCapable,
+                     axmMigrationStatus: axmMigrationStatus, migrationDeadlineWindow: migrationDeadlineWindow)
     navigateToDevices()
   }
 
@@ -111,43 +116,129 @@ struct AxMDashboardContent: View {
       }
       .padding(.horizontal, 24)
 
-      // MARK: MDM Assignment — only shown when data exists
+      // MARK: MDM Assignment + Migration Capability — same row.
       if fs.mdmAssigned > 0 || fs.mdmUnassigned > 0 {
-        CardSection(title: "MDM Assignment", icon: "server.rack") {
-          HStack(alignment: .top, spacing: 16) {
-            HStack(spacing: 12) {
-              DashboardDrillDown(action: { drillDown(mdmServer: AppStore.mdmAssignedSentinel) }) {
-                CoverageStatCard(
-                  title: "Assigned", value: fs.mdmAssigned, total: fs.axmTotal,
-                  icon: "checkmark.circle.fill", color: .purple,
-                  tooltip: InfoContent(
-                    icon: "checkmark.circle.fill", title: "MDM Assigned",
-                    summary: "AxM devices assigned to a Device Management Service (MDM server).",
-                    bullets: ["These devices are enrolled in an MDM server in \(scopeAbbrev).",
-                              "Breakdown by server is shown on the right."]))
+        HStack(alignment: .top, spacing: 16) {
+          CardSection(title: "MDM Assignment", icon: "server.rack") {
+            HStack(alignment: .top, spacing: 16) {
+              HStack(spacing: 12) {
+                DashboardDrillDown(action: { drillDown(mdmServer: AppStore.mdmAssignedSentinel) }) {
+                  CoverageStatCard(
+                    title: "Assigned", value: fs.mdmAssigned, total: fs.axmTotal,
+                    icon: "checkmark.circle.fill", color: .purple,
+                    tooltip: InfoContent(
+                      icon: "checkmark.circle.fill", title: "MDM Assigned",
+                      summary: "AxM devices assigned to a Device Management Service (MDM server).",
+                      bullets: ["These devices are enrolled in an MDM server in \(scopeAbbrev).",
+                                "Breakdown by server is shown on the right."]))
+                }
+                DashboardDrillDown(action: { drillDown(mdmServer: AppStore.mdmUnassignedSentinel) }) {
+                  CoverageStatCard(
+                    title: "Unassigned", value: fs.mdmUnassigned, total: fs.axmTotal,
+                    icon: "questionmark.circle.fill", color: .secondary,
+                    tooltip: InfoContent(
+                      icon: "questionmark.circle.fill", title: "MDM Unassigned",
+                      summary: "AxM devices not assigned to any Device Management Service.",
+                      bullets: ["These devices are registered in \(scopeAbbrev) but have not been assigned to an MDM server.",
+                                "Use the Devices tab to find and review these devices."]))
+                }
               }
-              DashboardDrillDown(action: { drillDown(mdmServer: AppStore.mdmUnassignedSentinel) }) {
-                CoverageStatCard(
-                  title: "Unassigned", value: fs.mdmUnassigned, total: fs.axmTotal,
-                  icon: "questionmark.circle.fill", color: .secondary,
-                  tooltip: InfoContent(
-                    icon: "questionmark.circle.fill", title: "MDM Unassigned",
-                    summary: "AxM devices not assigned to any Device Management Service.",
-                    bullets: ["These devices are registered in \(scopeAbbrev) but have not been assigned to an MDM server.",
-                              "Use the Devices tab to find and review these devices."]))
+              if !fs.mdmServerBreakdown.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                  Text("MDM Servers")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 2)
+                  BreakdownList(breakdown: fs.mdmServerBreakdown, color: .purple, maxRows: 10,
+                                onTapRow: { name in drillDown(mdmServer: name) })
+                }
+                .frame(maxWidth: .infinity)
               }
             }
-            if !fs.mdmServerBreakdown.isEmpty {
-              Divider()
-              VStack(alignment: .leading, spacing: 8) {
-                Text("MDM Servers")
-                  .font(.caption)
-                  .foregroundStyle(.secondary)
-                  .padding(.bottom, 2)
-                BreakdownList(breakdown: fs.mdmServerBreakdown, color: .purple, maxRows: 10,
-                              onTapRow: { name in drillDown(mdmServer: name) })
+          }
+          if !fs.mdmMigrationCapableBreakdown.isEmpty {
+            CardSection(title: "MDM Migration Capability", icon: "arrow.triangle.2.circlepath") {
+              HStack(spacing: 20) {
+                DonutChartView(
+                  segments: DonutChartView.segments(from: fs.mdmMigrationCapableBreakdown, palette: [.green, .orange, .secondary]),
+                  centerTitle: "\(fs.mdmMigrationCapableBreakdown.values.reduce(0, +))", centerSubtitle: "devices")
+                  .frame(width: 130, height: 130)
+                VStack(alignment: .leading, spacing: 8) {
+                  ForEach(DonutChartView.segments(from: fs.mdmMigrationCapableBreakdown, palette: [.green, .orange, .secondary])) { seg in
+                    DashboardDrillDown(action: { drillDown(mdmMigrationCapable: seg.label) }) {
+                      CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
+                    }
+                  }
+                }
               }
-              .frame(maxWidth: .infinity)
+            }
+          }
+        }
+        .padding(.horizontal, 24)
+      }
+
+      // MARK: MDM Migration Status & Deadline — full width, always shown when
+      // there's any AxM data. "Not Requested" is a real, meaningful state (no
+      // migration has been asked for yet), not a placeholder to hide.
+      //
+      // Stat cards, not a donut: this data is typically extremely skewed (almost
+      // everything "Not Requested" until migrations actually start), and a donut
+      // renders a small-but-real count (e.g. 4 of 1325) as a sliver of roughly a
+      // degree — effectively invisible next to angularInset/cornerRadius, even
+      // though the legend text is technically still correct. A stat card gives
+      // every status equal visual weight regardless of proportion, matching how
+      // MDM Assignment right above already handles its own Assigned/Unassigned
+      // split without a donut.
+      if !fs.axmMigrationStatusBreakdown.isEmpty {
+        CardSection(title: "MDM Migration Status", icon: "arrow.triangle.2.circlepath.circle") {
+          VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+              DashboardDrillDown(action: { drillDown(axmMigrationStatus: "Not Requested") }) {
+                CoverageStatCard(title: "Not Requested", value: fs.axmMigrationStatusBreakdown["Not Requested"] ?? 0, total: fs.axmTotal,
+                                 icon: "minus.circle", color: .secondary)
+              }
+              DashboardDrillDown(action: { drillDown(axmMigrationStatus: "Requested") }) {
+                CoverageStatCard(title: "Requested", value: fs.axmMigrationStatusBreakdown["Requested"] ?? 0, total: fs.axmTotal,
+                                 icon: "arrow.triangle.2.circlepath", color: .blue)
+              }
+              DashboardDrillDown(action: { drillDown(axmMigrationStatus: "In Progress") }) {
+                CoverageStatCard(title: "In Progress", value: fs.axmMigrationStatusBreakdown["In Progress"] ?? 0, total: fs.axmTotal,
+                                 icon: "clock.fill", color: .orange)
+              }
+              DashboardDrillDown(action: { drillDown(axmMigrationStatus: "Success") }) {
+                CoverageStatCard(title: "Success", value: fs.axmMigrationStatusBreakdown["Success"] ?? 0, total: fs.axmTotal,
+                                 icon: "checkmark.circle.fill", color: .green)
+              }
+              DashboardDrillDown(action: { drillDown(axmMigrationStatus: "Failed") }) {
+                CoverageStatCard(title: "Failed", value: fs.axmMigrationStatusBreakdown["Failed"] ?? 0, total: fs.axmTotal,
+                                 icon: "xmark.circle.fill", color: .red)
+              }
+            }
+            if fs.axmMigrationDeadline30 + fs.axmMigrationDeadline60 + fs.axmMigrationDeadline90 > 0 {
+              Divider()
+              Text("Deadline Approaching")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+              HStack(spacing: 12) {
+                DashboardDrillDown(action: { drillDown(migrationDeadlineWindow: "0–30") }) {
+                  CoverageStatCard(title: "Next 30 Days", value: fs.axmMigrationDeadline30, total: fs.axmTotal,
+                                   icon: "exclamationmark.triangle.fill", color: .red)
+                }
+                DashboardDrillDown(action: { drillDown(migrationDeadlineWindow: "31–60") }) {
+                  CoverageStatCard(title: "31–60 Days", value: fs.axmMigrationDeadline60, total: fs.axmTotal,
+                                   icon: "clock.badge.exclamationmark.fill", color: .orange)
+                }
+                DashboardDrillDown(action: { drillDown(migrationDeadlineWindow: "61–90") }) {
+                  CoverageStatCard(title: "61–90 Days", value: fs.axmMigrationDeadline90, total: fs.axmTotal,
+                                   icon: "clock.fill", color: .yellow,
+                                   tooltip: InfoContent(
+                                     icon: "clock.fill", title: "Migration Deadline in 61–90 Days",
+                                     summary: "These devices have an in-progress MDM migration whose deadline is 61 to 90 days out.",
+                                     bullets: ["Apple caps migration deadlines at 90 days out, so this captures the full window.",
+                                               "Only Requested/In Progress migrations are counted — a completed or failed migration has no live deadline."]))
+                }
+              }
             }
           }
         }
@@ -165,32 +256,39 @@ struct AxMDashboardContent: View {
       }
       .padding(.horizontal, 24)
 
-      // MARK: Sync status
-      CardSection(title: scopeFull, icon: "applelogo") {
-        SyncTimestampRow(label: "Last sync", timestamp: s.lastAxmSync)
-        if s.runAxmFetched > 0 {
-          DashStatRow(label: "Fetched this run", value: s.runAxmFetched, color: .blue)
-        }
-      }
-      .padding(.horizontal, 24)
-
       // MARK: Coverage distribution ring — same coverage fields the Default
       // dashboard shows, since they're already scoped to AxM-having devices.
-      // Placed last — a summary visual, not the first thing worth acting on.
       CardSection(title: "Coverage Distribution", icon: "chart.pie.fill") {
         HStack(spacing: 64) {
           CoverageRingView(active: fs.coverageActive, inactive: fs.coverageInactive,
                             noPlan: fs.coverageNoPlan, neverFetched: fs.coverageNeverFetched)
             .frame(width: 220, height: 220)
           VStack(alignment: .leading, spacing: 16) {
-            CoverageLegendRow(label: "In Warranty",      value: fs.coverageActive,       color: .green)
-            CoverageLegendRow(label: "Out of Warranty",  value: fs.coverageInactive,     color: .red)
-            CoverageLegendRow(label: "No Coverage Info", value: fs.coverageNoPlan,       color: .orange)
-            CoverageLegendRow(label: "Never Fetched",    value: fs.coverageNeverFetched, color: .secondary)
+            DashboardDrillDown(action: { drillDown(coverage: .active) }) {
+              CoverageLegendRow(label: "In Warranty",      value: fs.coverageActive,       color: .green,     total: fs.axmTotal)
+            }
+            DashboardDrillDown(action: { drillDown(coverage: .inactive) }) {
+              CoverageLegendRow(label: "Out of Warranty",  value: fs.coverageInactive,     color: .red,       total: fs.axmTotal)
+            }
+            DashboardDrillDown(action: { drillDown(coverage: .noCoverage) }) {
+              CoverageLegendRow(label: "No Coverage Info", value: fs.coverageNoPlan,       color: .orange,    total: fs.axmTotal)
+            }
+            DashboardDrillDown(action: { drillDown(coverage: .notFetched) }) {
+              CoverageLegendRow(label: "Never Fetched",    value: fs.coverageNeverFetched, color: .secondary, total: fs.axmTotal)
+            }
           }
           Spacer()
         }
         .padding(.vertical, 8)
+      }
+      .padding(.horizontal, 24)
+
+      // MARK: Sync status — moved to the very end, below Coverage Distribution.
+      CardSection(title: scopeFull, icon: "applelogo") {
+        SyncTimestampRow(label: "Last sync", timestamp: s.lastAxmSync)
+        if s.runAxmFetched > 0 {
+          DashStatRow(label: "Fetched this run", value: s.runAxmFetched, color: .blue)
+        }
       }
       .padding(.horizontal, 24)
     }

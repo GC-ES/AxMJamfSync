@@ -218,6 +218,15 @@ struct Device: Identifiable, Hashable {
     let axmCoverageEndDate:     String?
     let axmCoverageFetchedAt:   String?
     let axmAgreementNumber:     String?
+    let axmWifiMacAddress:      String?
+    let axmBluetoothMacAddress: String?
+    let axmEthernetMacAddress:  String?   // joined ", " — ABM returns an array
+    let axmImei:                String?   // joined ", " — ABM returns an array
+    let axmMeid:                String?   // joined ", " — ABM returns an array
+    let axmEid:                 String?
+    let axmMdmMigrationCapable: String?   // "True" | "False" — tri-state, nil = not yet populated by Apple
+    let axmMdmMigrationStatus:  String?   // "REQUESTED" | "STARTED" | "SUCCESS" | "FAILED"
+    let axmMdmMigrationDeadline: String?  // raw ISO 8601 — never parsed to Date at this layer
     let wbStatus:               WBStatus?
     let wbPushedAt:             String?
     let wbNote:                 String?
@@ -273,6 +282,17 @@ struct Device: Identifiable, Hashable {
         guard let raw = jamfMdmCertExpiration else { return nil }
         return Self.mdmCertExpirationParser.date(from: raw)
             ?? Self.mdmCertExpirationParserFrac.date(from: raw)
+    }
+
+    // axmMdmMigrationDeadline stays raw String in storage for the same reason —
+    // Apple's own API example shows fractional seconds ("2026-03-15T17:00:00.000Z"),
+    // so that parser is tried first here (opposite priority from the Jamf cert
+    // date above, whose confirmed live format has none). Reuses the same two
+    // formatter instances since both are just plain ISO8601 parsers underneath.
+    var axmMdmMigrationDeadlineDate: Date? {
+        guard let raw = axmMdmMigrationDeadline else { return nil }
+        return Self.mdmCertExpirationParserFrac.date(from: raw)
+            ?? Self.mdmCertExpirationParser.date(from: raw)
     }
 
     // P2: Explicit Hashable/Equatable — auto-synthesis hashes ALL 35 fields including
@@ -394,6 +414,15 @@ struct Device: Identifiable, Hashable {
             axmCoverageEndDate:   axmCoverageEndDate   ?? self.axmCoverageEndDate,
             axmCoverageFetchedAt: axmCoverageFetchedAt ?? self.axmCoverageFetchedAt,
             axmAgreementNumber:   axmAgreementNumber   ?? self.axmAgreementNumber,
+            axmWifiMacAddress:    axmWifiMacAddress,
+            axmBluetoothMacAddress: axmBluetoothMacAddress,
+            axmEthernetMacAddress: axmEthernetMacAddress,
+            axmImei:              axmImei,
+            axmMeid:              axmMeid,
+            axmEid:               axmEid,
+            axmMdmMigrationCapable: axmMdmMigrationCapable,
+            axmMdmMigrationStatus: axmMdmMigrationStatus,
+            axmMdmMigrationDeadline: axmMdmMigrationDeadline,
             wbStatus:             wbStatus             ?? self.wbStatus,
             wbPushedAt:           wbPushedAt           ?? self.wbPushedAt,
             wbNote:               wbNote               ?? self.wbNote,
@@ -478,6 +507,11 @@ struct DashboardStats {
     var mdmAssigned:         Int = 0
     var mdmUnassigned:       Int = 0
     var mdmServerBreakdown:  [String: Int] = [:]  // serverName → device count
+    var mdmMigrationCapableBreakdown: [String: Int] = [:]  // "Capable" / "Not Capable" / "Unknown" → count
+    var axmMigrationStatusBreakdown: [String: Int] = [:]   // "Requested" / "In Progress" / "Success" / "Failed" → count
+    var axmMigrationDeadline30: Int = 0                    // in-progress migration deadline within 30 days
+    var axmMigrationDeadline60: Int = 0                    // 31–60 days out
+    var axmMigrationDeadline90: Int = 0                    // 61–90 days out
 
     // MARK: - AxM-focus breakdowns (Dashboard "Apple" mode)
     var axmProductFamilyBreakdown:  [String: Int] = [:]  // "Mac" / "iPad" / "iPhone" / "AppleTV" → count
@@ -498,6 +532,17 @@ struct DashboardStats {
     var jamfCheckinThisMonth:     Int = 0                // 7–30 days since last contact
     var jamfCheckinStale:         Int = 0                // last contact > 30 days ago
     var jamfCheckinNever:         Int = 0                // no last-contact date on record
+    var jamfCertExpiring30:       Int = 0               // MDM cert expiring within 30 days
+    var jamfCertExpiring60:       Int = 0               // 31–60 days out
+    var jamfCertExpiring90:       Int = 0               // 61–90 days out
+    var jamfArchitectureBreakdown: [String: Int] = [:]  // "Apple Silicon" / "Intel" / "Unknown" → count (computers only)
+    var jamfRamBreakdown:         [String: Int] = [:]   // e.g. "16 GB" → count (computers only)
+    var jamfOsCurrentCount:       Int = 0                // computers on the newest major macOS version seen in this population
+    var jamfOsOneBehindCount:     Int = 0
+    var jamfOsTwoPlusBehindCount: Int = 0
+    var jamfMobileOsCurrentCount:       Int = 0          // mobile devices on the newest major iOS/iPadOS/tvOS/visionOS version seen in this population
+    var jamfMobileOsOneBehindCount:     Int = 0
+    var jamfMobileOsTwoPlusBehindCount: Int = 0
 }
 
 // MARK: - AxM Scope
@@ -586,6 +631,7 @@ extension Device {
                axmModel: nil, axmDeviceModel: nil, axmDeviceClass: nil, axmProductFamily: "Mac",
                axmCoverageStatus: "ACTIVE", axmCoverageEndDate: "2027-03-01",
                axmCoverageFetchedAt: "2026-03-03T20:07:36Z", axmAgreementNumber: "APP-123456",
+               axmWifiMacAddress: "a4:5e:60:ab:cd:ef", axmBluetoothMacAddress: "a4:5e:60:ab:cd:f0", axmEthernetMacAddress: nil, axmImei: nil, axmMeid: nil, axmEid: nil, axmMdmMigrationCapable: nil, axmMdmMigrationStatus: nil, axmMdmMigrationDeadline: nil,
                wbStatus: .synced, wbPushedAt: "2026-03-03T20:10:00Z", wbNote: nil,
                jamfId: "142", jamfName: "MacBook-Pro-KM", jamfManaged: "True",
                jamfModel: "MacBook Pro 15\"", jamfModelIdentifier: "MacBookPro8,2",
@@ -599,6 +645,7 @@ extension Device {
                axmModel: nil, axmDeviceModel: nil, axmDeviceClass: nil, axmProductFamily: nil,
                axmCoverageStatus: "NO_COVERAGE", axmCoverageEndDate: nil,
                axmCoverageFetchedAt: "2026-03-03T20:07:36Z", axmAgreementNumber: nil,
+               axmWifiMacAddress: nil, axmBluetoothMacAddress: nil, axmEthernetMacAddress: nil, axmImei: nil, axmMeid: nil, axmEid: nil, axmMdmMigrationCapable: nil, axmMdmMigrationStatus: nil, axmMdmMigrationDeadline: nil,
                wbStatus: nil, wbPushedAt: nil, wbNote: nil,
                jamfId: nil, jamfName: nil, jamfManaged: nil, jamfModel: nil,
                jamfModelIdentifier: nil, jamfMacAddress: nil, jamfReportDate: nil,
@@ -612,6 +659,7 @@ extension Device {
                axmModel: nil, axmDeviceModel: nil, axmDeviceClass: nil, axmProductFamily: "Mac",
                axmCoverageStatus: "EXPIRED", axmCoverageEndDate: "2025-01-15",
                axmCoverageFetchedAt: "2026-03-03T20:07:36Z", axmAgreementNumber: "APP-789012",
+               axmWifiMacAddress: nil, axmBluetoothMacAddress: nil, axmEthernetMacAddress: nil, axmImei: nil, axmMeid: nil, axmEid: nil, axmMdmMigrationCapable: "True", axmMdmMigrationStatus: "STARTED", axmMdmMigrationDeadline: "2026-05-01T17:00:00.000Z",
                wbStatus: .failed, wbPushedAt: nil, wbNote: "HTTP 404: computer not found",
                jamfId: "201", jamfName: "MacBook-Air-Finance", jamfManaged: "True",
                jamfModel: "MacBook Air", jamfModelIdentifier: "MacBookAir10,1",
@@ -624,6 +672,7 @@ extension Device {
                axmPurchaseSource: nil, axmPurchaseSourceId: nil, axmOrderNumber: nil, axmOrderDate: nil, axmAddedToOrgDate: nil, axmModel: nil, axmDeviceModel: nil, axmDeviceClass: nil, axmProductFamily: nil,
                axmCoverageStatus: nil, axmCoverageEndDate: nil,
                axmCoverageFetchedAt: nil, axmAgreementNumber: nil,
+               axmWifiMacAddress: nil, axmBluetoothMacAddress: nil, axmEthernetMacAddress: nil, axmImei: nil, axmMeid: nil, axmEid: nil, axmMdmMigrationCapable: nil, axmMdmMigrationStatus: nil, axmMdmMigrationDeadline: nil,
                wbStatus: nil, wbPushedAt: nil, wbNote: nil,
                jamfId: "305", jamfName: "Mac-IT-Desk", jamfManaged: "False",
                jamfModel: "Mac mini", jamfModelIdentifier: "Macmini9,1",

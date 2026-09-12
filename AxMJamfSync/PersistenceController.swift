@@ -616,6 +616,17 @@ extension CDDevice {
         axmCoverageStatus   = d.axmCoverageStatus
         axmCoverageEndDate  = d.axmCoverageEndDate
         axmAgreementNumber  = d.axmAgreementNumber
+        axmWifiMacAddress      = d.axmWifiMacAddress
+        axmBluetoothMacAddress = d.axmBluetoothMacAddress
+        axmEthernetMacAddress  = d.axmEthernetMacAddress
+        axmImei                = d.axmImei
+        axmMeid                = d.axmMeid
+        axmEid                 = d.axmEid
+        // Written to axmMdmMigrationCapableRaw (String), not axmMdmMigrationCapable
+        // (Boolean) — see the schema comment on axmMdmMigrationCapableRaw for why.
+        axmMdmMigrationCapableRaw = d.axmMdmMigrationCapable
+        axmMdmMigrationStatus  = d.axmMdmMigrationStatus
+        axmMdmMigrationDeadline = d.axmMdmMigrationDeadline
         wbStatus            = d.wbStatus?.rawValue
         wbNote              = d.wbNote
         jamfId              = d.jamfId
@@ -681,6 +692,15 @@ extension CDDevice {
             axmCoverageEndDate:   axmCoverageEndDate,
             axmCoverageFetchedAt: fmt(axmCoverageFetchedAt),
             axmAgreementNumber:   axmAgreementNumber,
+            axmWifiMacAddress:    axmWifiMacAddress,
+            axmBluetoothMacAddress: axmBluetoothMacAddress,
+            axmEthernetMacAddress: axmEthernetMacAddress,
+            axmImei:              axmImei,
+            axmMeid:              axmMeid,
+            axmEid:               axmEid,
+            axmMdmMigrationCapable: axmMdmMigrationCapableRaw,
+            axmMdmMigrationStatus: axmMdmMigrationStatus,
+            axmMdmMigrationDeadline: axmMdmMigrationDeadline,
             wbStatus:             WBStatus(rawValue: wbStatus ?? ""),
             wbPushedAt:           fmt(wbPushedAt),
             wbNote:               wbNote,

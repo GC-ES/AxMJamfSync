@@ -99,6 +99,14 @@ final class AppStore: ObservableObject {
     @Published var fileVaultFilter:        String?  = nil { didSet { scheduleFilter() } }  // AppStore.fileVaultLabel(for:)
     @Published var checkinFreshnessFilter: String?  = nil { didSet { scheduleFilter() } }  // AppStore.checkinBucketLabel(for:)
     @Published var expiringWindowFilter:   String?  = nil { didSet { scheduleFilter() } }  // AppStore.expiringWindowLabel(for:)
+    @Published var mdmMigrationCapableFilter: String? = nil { didSet { scheduleFilter() } }  // AppStore.mdmMigrationCapableLabel(for:)
+    @Published var certExpiringWindowFilter: String? = nil { didSet { scheduleFilter() } }  // AppStore.certExpiringWindowLabel(for:)
+    @Published var architectureFilter:       String? = nil { didSet { scheduleFilter() } }  // AppStore.architectureLabel(for:)
+    @Published var ramFilter:                String? = nil { didSet { scheduleFilter() } }  // AppStore.ramLabel(for:)
+    @Published var osBehindFilter:           String? = nil { didSet { scheduleFilter() } }  // AppStore.osBehindLabel(for:latestVersion:) — paired with osBehindLatestVersionFilter
+    @Published var osBehindLatestVersionFilter: Int? = nil { didSet { scheduleFilter() } }  // fleet-latest major version captured at tap time, so the drill-down classifies devices against the exact same "latest" the tapped card counted
+    @Published var axmMigrationStatusFilter: String? = nil { didSet { scheduleFilter() } }  // AppStore.axmMigrationStatusLabel(for:)
+    @Published var migrationDeadlineWindowFilter: String? = nil { didSet { scheduleFilter() } }  // AppStore.migrationDeadlineWindowLabel(for:)
 
     /// Resets every device-list filter, old and new — used by "Clear all filters" in
     /// DevicesView and by wipeCache().
@@ -118,6 +126,14 @@ final class AppStore: ObservableObject {
         fileVaultFilter       = nil
         checkinFreshnessFilter = nil
         expiringWindowFilter  = nil
+        mdmMigrationCapableFilter = nil
+        certExpiringWindowFilter = nil
+        architectureFilter    = nil
+        ramFilter             = nil
+        osBehindFilter        = nil
+        osBehindLatestVersionFilter = nil
+        axmMigrationStatusFilter = nil
+        migrationDeadlineWindowFilter = nil
     }
 
     /// Human-readable description of the Dashboard drill-down filters specifically —
@@ -136,6 +152,13 @@ final class AppStore: ObservableObject {
         if let v = fileVaultFilter       { return "FileVault: \(v)" }
         if let v = checkinFreshnessFilter { return "Check-in: \(v)" }
         if let v = expiringWindowFilter  { return "Expiring: \(v) days" }
+        if let v = mdmMigrationCapableFilter { return "MDM Migration: \(v)" }
+        if let v = certExpiringWindowFilter { return "MDM Cert Expiring: \(v) days" }
+        if let v = architectureFilter    { return "Architecture: \(v)" }
+        if let v = ramFilter             { return "RAM: \(v)" }
+        if let v = osBehindFilter        { return "OS Version: \(v)" }
+        if let v = axmMigrationStatusFilter { return "Migration Status: \(v)" }
+        if let v = migrationDeadlineWindowFilter { return "Migration Deadline: \(v) days" }
         return nil
     }
 
@@ -151,6 +174,14 @@ final class AppStore: ObservableObject {
         fileVaultFilter        = nil
         checkinFreshnessFilter = nil
         expiringWindowFilter   = nil
+        mdmMigrationCapableFilter = nil
+        certExpiringWindowFilter = nil
+        architectureFilter     = nil
+        ramFilter              = nil
+        osBehindFilter         = nil
+        osBehindLatestVersionFilter = nil
+        axmMigrationStatusFilter = nil
+        migrationDeadlineWindowFilter = nil
     }
 
     /// Convenience for Dashboard drill-down taps: clears every existing filter first,
@@ -161,7 +192,11 @@ final class AppStore: ObservableObject {
                    deviceType: DeviceKind? = nil, mdmServer: String? = nil,
                    axmStatus: String? = nil, productFamily: String? = nil, purchaseSource: String? = nil,
                    addedToOrgYear: String? = nil, jamfManaged: Bool? = nil, osVersion: String? = nil,
-                   fileVault: String? = nil, checkin: String? = nil, expiringWindow: String? = nil) {
+                   fileVault: String? = nil, checkin: String? = nil, expiringWindow: String? = nil,
+                   mdmMigrationCapable: String? = nil, certExpiringWindow: String? = nil,
+                   architecture: String? = nil, ram: String? = nil,
+                   osBehind: String? = nil, osBehindLatestVersion: Int? = nil,
+                   axmMigrationStatus: String? = nil, migrationDeadlineWindow: String? = nil) {
         clearDeviceFilters()
         deviceSourceFilter     = source
         coverageFilter         = coverage
@@ -177,6 +212,14 @@ final class AppStore: ObservableObject {
         fileVaultFilter        = fileVault
         checkinFreshnessFilter = checkin
         expiringWindowFilter   = expiringWindow
+        mdmMigrationCapableFilter = mdmMigrationCapable
+        certExpiringWindowFilter = certExpiringWindow
+        architectureFilter     = architecture
+        ramFilter              = ram
+        osBehindFilter         = osBehind
+        osBehindLatestVersionFilter = osBehindLatestVersion
+        axmMigrationStatusFilter = axmMigrationStatus
+        migrationDeadlineWindowFilter = migrationDeadlineWindow
     }
 
     // MARK: - Export
@@ -371,7 +414,11 @@ final class AppStore: ObservableObject {
     private nonisolated static func matchesDrillDownFilters(_ d: Device,
         axmStatus: String?, productFamily: String?, purchaseSource: String?,
         addedToOrgYear: String?, jamfManaged: Bool?, osVersion: String?,
-        fileVault: String?, checkin: String?, expiringWindow: String?
+        fileVault: String?, checkin: String?, expiringWindow: String?,
+        mdmMigrationCapable: String?, certExpiringWindow: String?,
+        architecture: String?, ram: String?,
+        osBehind: String?, osBehindLatestVersion: Int?,
+        axmMigrationStatus: String?, migrationDeadlineWindow: String?
     ) -> Bool {
         if let st = axmStatus {
             guard d.deviceSource != .jamfOnly, (d.axmDeviceStatus?.uppercased() ?? "") == st else { return false }
@@ -399,6 +446,27 @@ final class AppStore: ObservableObject {
         }
         if let ew = expiringWindow {
             guard d.deviceSource != .jamfOnly, Self.expiringWindowLabel(for: d) == ew else { return false }
+        }
+        if let mc = mdmMigrationCapable {
+            guard d.deviceSource != .jamfOnly, d.axmDeviceId != nil, Self.mdmMigrationCapableLabel(for: d) == mc else { return false }
+        }
+        if let ce = certExpiringWindow {
+            guard d.deviceSource != .axmOnly, Self.certExpiringWindowLabel(for: d) == ce else { return false }
+        }
+        if let arch = architecture {
+            guard d.deviceSource != .axmOnly, d.jamfDeviceType == "computer", Self.architectureLabel(for: d) == arch else { return false }
+        }
+        if let r = ram {
+            guard d.deviceSource != .axmOnly, d.jamfDeviceType == "computer", Self.ramLabel(for: d) == r else { return false }
+        }
+        if let ob = osBehind {
+            guard d.deviceSource != .axmOnly, Self.osBehindLabel(for: d, latestVersion: osBehindLatestVersion) == ob else { return false }
+        }
+        if let ms = axmMigrationStatus {
+            guard d.deviceSource != .jamfOnly, d.axmDeviceId != nil, Self.axmMigrationStatusLabel(for: d) == ms else { return false }
+        }
+        if let mdw = migrationDeadlineWindow {
+            guard d.deviceSource != .jamfOnly, d.axmDeviceId != nil, Self.migrationDeadlineWindowLabel(for: d) == mdw else { return false }
         }
         return true
     }
@@ -434,7 +502,11 @@ final class AppStore: ObservableObject {
         wb: WBStatus?, searchText: String, noDrillDown: Bool,
         axmStatus: String?, productFamily: String?, purchaseSource: String?,
         addedToOrgYear: String?, jamfManaged: Bool?, osVersion: String?,
-        fileVault: String?, checkin: String?, expiringWindow: String?
+        fileVault: String?, checkin: String?, expiringWindow: String?,
+        mdmMigrationCapable: String?, certExpiringWindow: String?,
+        architecture: String?, ram: String?,
+        osBehind: String?, osBehindLatestVersion: Int?,
+        axmMigrationStatus: String?, migrationDeadlineWindow: String?
     ) -> Bool {
         if let src = source,   d.deviceSource  != src  { return false }
         if let cov = coverage, d.coverageStatus != cov  { return false }
@@ -459,7 +531,11 @@ final class AppStore: ObservableObject {
         if !noDrillDown, !Self.matchesDrillDownFilters(d,
             axmStatus: axmStatus, productFamily: productFamily, purchaseSource: purchaseSource,
             addedToOrgYear: addedToOrgYear, jamfManaged: jamfManaged, osVersion: osVersion,
-            fileVault: fileVault, checkin: checkin, expiringWindow: expiringWindow) { return false }
+            fileVault: fileVault, checkin: checkin, expiringWindow: expiringWindow,
+            mdmMigrationCapable: mdmMigrationCapable, certExpiringWindow: certExpiringWindow,
+            architecture: architecture, ram: ram,
+            osBehind: osBehind, osBehindLatestVersion: osBehindLatestVersion,
+            axmMigrationStatus: axmMigrationStatus, migrationDeadlineWindow: migrationDeadlineWindow) { return false }
         return true
     }
 
@@ -480,8 +556,18 @@ final class AppStore: ObservableObject {
         let fvF        = fileVaultFilter
         let checkinF   = checkinFreshnessFilter
         let expiringF  = expiringWindowFilter
+        let mdmCapF    = mdmMigrationCapableFilter
+        let certExpF   = certExpiringWindowFilter
+        let archF      = architectureFilter
+        let ramF       = ramFilter
+        let osBehindF  = osBehindFilter
+        let osBehindLatestF = osBehindLatestVersionFilter
+        let axmMigStatusF = axmMigrationStatusFilter
+        let migDeadlineF  = migrationDeadlineWindowFilter
         let noDrillDown = axmStatusF == nil && familyF == nil && purchaseF == nil && yearF == nil
                        && managedF == nil && osVerF == nil && fvF == nil && checkinF == nil && expiringF == nil
+                       && mdmCapF == nil && certExpF == nil && archF == nil && ramF == nil && osBehindF == nil
+                       && axmMigStatusF == nil && migDeadlineF == nil
 
         let result: [Device]
         if srcFilter == nil && covFilter == nil && wbF == nil && typeFilter == nil && mdmFilter == nil && searchText.isEmpty && noDrillDown {
@@ -492,7 +578,11 @@ final class AppStore: ObservableObject {
                     mdm: mdmFilter, wb: wbF, searchText: searchText, noDrillDown: noDrillDown,
                     axmStatus: axmStatusF, productFamily: familyF, purchaseSource: purchaseF,
                     addedToOrgYear: yearF, jamfManaged: managedF, osVersion: osVerF,
-                    fileVault: fvF, checkin: checkinF, expiringWindow: expiringF)
+                    fileVault: fvF, checkin: checkinF, expiringWindow: expiringF,
+                    mdmMigrationCapable: mdmCapF, certExpiringWindow: certExpF,
+                    architecture: archF, ram: ramF,
+                    osBehind: osBehindF, osBehindLatestVersion: osBehindLatestF,
+                    axmMigrationStatus: axmMigStatusF, migrationDeadlineWindow: migDeadlineF)
             }
         }
         filteredDevices  = result
@@ -642,8 +732,18 @@ final class AppStore: ObservableObject {
         let fvF        = fileVaultFilter
         let checkinF   = checkinFreshnessFilter
         let expiringF  = expiringWindowFilter
+        let mdmCapF    = mdmMigrationCapableFilter
+        let certExpF   = certExpiringWindowFilter
+        let archF      = architectureFilter
+        let ramF       = ramFilter
+        let osBehindF  = osBehindFilter
+        let osBehindLatestF = osBehindLatestVersionFilter
+        let axmMigStatusF = axmMigrationStatusFilter
+        let migDeadlineF  = migrationDeadlineWindowFilter
         let noDrillDown = axmStatusF == nil && familyF == nil && purchaseF == nil && yearF == nil
                        && managedF == nil && osVerF == nil && fvF == nil && checkinF == nil && expiringF == nil
+                       && mdmCapF == nil && certExpF == nil && archF == nil && ramF == nil && osBehindF == nil
+                       && axmMigStatusF == nil && migDeadlineF == nil
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let result: [Device]
@@ -655,7 +755,11 @@ final class AppStore: ObservableObject {
                         mdm: mdmFilter, wb: wbF, searchText: searchText, noDrillDown: noDrillDown,
                         axmStatus: axmStatusF, productFamily: familyF, purchaseSource: purchaseF,
                         addedToOrgYear: yearF, jamfManaged: managedF, osVersion: osVerF,
-                        fileVault: fvF, checkin: checkinF, expiringWindow: expiringF)
+                        fileVault: fvF, checkin: checkinF, expiringWindow: expiringF,
+                        mdmMigrationCapable: mdmCapF, certExpiringWindow: certExpF,
+                        architecture: archF, ram: ramF,
+                        osBehind: osBehindF, osBehindLatestVersion: osBehindLatestF,
+                        axmMigrationStatus: axmMigStatusF, migrationDeadlineWindow: migDeadlineF)
                 }
             }
             // DeviceListPanel keys its List on filterGeneration, forcing a full remount
@@ -757,6 +861,81 @@ final class AppStore: ObservableObject {
         if daysOut <= 90 { return "61–90" }
         return nil
     }
+    nonisolated static func mdmMigrationCapableLabel(for d: Device) -> String {
+        switch d.axmMdmMigrationCapable {
+        case "True":  return "Capable"
+        case "False": return "Not Capable"
+        default:      return "Unknown"
+        }
+    }
+    nonisolated static func axmMigrationStatusLabel(for d: Device) -> String {
+        switch d.axmMdmMigrationStatus {
+        case "REQUESTED": return "Requested"
+        case "STARTED":   return "In Progress"
+        case "SUCCESS":   return "Success"
+        case "FAILED":    return "Failed"
+        default:          return "Not Requested"
+        }
+    }
+    /// Non-overlapping "days until migration deadline" bucket, mirroring
+    /// expiringWindowLabel's shape exactly. Only meaningful for an in-progress
+    /// migration (Requested/In Progress) — a completed or failed migration has
+    /// no live deadline to be urgent about, even if the raw field is still set.
+    nonisolated static func migrationDeadlineWindowLabel(for d: Device) -> String? {
+        let status = Self.axmMigrationStatusLabel(for: d)
+        guard status == "Requested" || status == "In Progress",
+              let end = d.axmMdmMigrationDeadlineDate else { return nil }
+        let daysOut = end.timeIntervalSinceNow / 86_400
+        guard daysOut >= 0 else { return nil }
+        if daysOut <= 30 { return "0–30" }
+        if daysOut <= 60 { return "31–60" }
+        if daysOut <= 90 { return "61–90" }
+        return nil
+    }
+    /// Non-overlapping "days until MDM cert expires" bucket, mirroring
+    /// expiringWindowLabel's shape exactly. jamfMdmCertExpirationDate already
+    /// does the resilient raw-string parsing (see its declaration on Device).
+    nonisolated static func certExpiringWindowLabel(for d: Device) -> String? {
+        guard d.deviceSource != .axmOnly,
+              let end = d.jamfMdmCertExpirationDate else { return nil }
+        let daysOut = end.timeIntervalSinceNow / 86_400
+        guard daysOut >= 0 else { return nil }
+        if daysOut <= 30 { return "0–30" }
+        if daysOut <= 60 { return "31–60" }
+        if daysOut <= 90 { return "61–90" }
+        return nil
+    }
+    nonisolated static func architectureLabel(for d: Device) -> String {
+        guard let proc = d.jamfProcessorType, !proc.isEmpty else { return "Unknown" }
+        return proc.localizedCaseInsensitiveContains("Apple") ? "Apple Silicon" : "Intel"
+    }
+    /// Bare number, matching osMajorVersionLabel's convention (no unit suffix) —
+    /// BreakdownBarChart's .byVersionDescending sort does Int(key), which a " GB"
+    /// suffix would break. The card title supplies the "GB" context instead.
+    nonisolated static func ramLabel(for d: Device) -> String {
+        guard let ram = d.jamfRamGB, !ram.isEmpty else { return "Unknown" }
+        return ram
+    }
+    /// Fleet-relative "how many major OS versions behind the newest one seen
+    /// in this population" — deliberately takes latestVersion as a parameter
+    /// rather than looking it up itself: the caller (computeStats, for the
+    /// number shown; the drill-down filter, for the devices a tap lands on)
+    /// must both classify against the exact same "latest," or a tap could
+    /// disagree with the card that was tapped. See computeStats's second pass
+    /// for where latestVersion actually gets computed.
+    /// Deliberately has no device-kind or deviceSource gate of its own — same
+    /// style as osMajorVersionLabel, which doesn't either. computeStats calls
+    /// this once per population (computer, then mobile) with that population's
+    /// own latestVersion; the drill-down's accompanying `deviceType` filter
+    /// narrows the population there. A shared, kind-agnostic helper means macOS
+    /// and iOS both get "N behind" for free instead of two near-duplicate ones.
+    nonisolated static func osBehindLabel(for d: Device, latestVersion: Int?) -> String {
+        guard let latestVersion, let this = Int(osMajorVersionLabel(for: d)) else { return "Unknown" }
+        let behind = latestVersion - this
+        if behind <= 0 { return "Current" }
+        if behind == 1 { return "1 Behind" }
+        return "2+ Behind"
+    }
 
     // Single O(n) pass over a device array, producing every dashboard breakdown.
     // Pulled out as a pure nonisolated function so it can run against the full
@@ -820,6 +999,14 @@ final class AppStore: ObservableObject {
                 } else {
                     s.mdmUnassigned += 1
                 }
+                s.mdmMigrationCapableBreakdown[Self.mdmMigrationCapableLabel(for: d), default: 0] += 1
+                s.axmMigrationStatusBreakdown[Self.axmMigrationStatusLabel(for: d), default: 0] += 1
+                switch Self.migrationDeadlineWindowLabel(for: d) {
+                case "0–30":  s.axmMigrationDeadline30 += 1
+                case "31–60": s.axmMigrationDeadline60 += 1
+                case "61–90": s.axmMigrationDeadline90 += 1
+                default: break
+                }
             }
 
             // Dashboard "Apple Manager" focus breakdowns — AxM-sourced fields only.
@@ -861,6 +1048,17 @@ final class AppStore: ObservableObject {
                     case "Not Encrypted": s.jamfFileVaultNotEncrypted += 1
                     default:              s.jamfFileVaultUnknown      += 1
                     }
+                    // Hardware mix — architecture and RAM only apply to computers,
+                    // same scoping as FileVault above.
+                    s.jamfArchitectureBreakdown[Self.architectureLabel(for: d), default: 0] += 1
+                    s.jamfRamBreakdown[Self.ramLabel(for: d), default: 0] += 1
+                }
+
+                switch Self.certExpiringWindowLabel(for: d) {
+                case "0–30":  s.jamfCertExpiring30 += 1
+                case "31–60": s.jamfCertExpiring60 += 1
+                case "61–90": s.jamfCertExpiring90 += 1
+                default: break
                 }
 
                 switch Self.checkinBucketLabel(for: d) {
@@ -888,6 +1086,33 @@ final class AppStore: ObservableObject {
                     case .noCoverage:                       s.jamfCoverageNoPlan       += 1
                     case .notFetched:                       s.jamfCoverageNeverFetched += 1
                     }
+                }
+            }
+        }
+
+        // OS version "N behind" — a second, small pass, since the fleet's latest
+        // major version among each population isn't known until every device has
+        // been seen once via the loop above. No hardcoded target version: whatever
+        // the newest version actually present is becomes "Current," so this never
+        // goes stale as new macOS/iOS versions ship. Computers and mobile devices
+        // are entirely separate populations with their own "latest" (a shared
+        // number would be meaningless — see the unified-versioning comment above).
+        let latestMacOsVersion = s.jamfMacOsVersionBreakdown.keys.compactMap { Int($0) }.max()
+        let latestMobileOsVersion = s.jamfMobileOsVersionBreakdown.keys.compactMap { Int($0) }.max()
+        for d in devices {
+            if d.jamfDeviceType == "computer" {
+                switch Self.osBehindLabel(for: d, latestVersion: latestMacOsVersion) {
+                case "Current":   s.jamfOsCurrentCount += 1
+                case "1 Behind":  s.jamfOsOneBehindCount += 1
+                case "2+ Behind": s.jamfOsTwoPlusBehindCount += 1
+                default: break   // "Unknown" — unparseable version
+                }
+            } else if d.jamfDeviceType == "mobile" {
+                switch Self.osBehindLabel(for: d, latestVersion: latestMobileOsVersion) {
+                case "Current":   s.jamfMobileOsCurrentCount += 1
+                case "1 Behind":  s.jamfMobileOsOneBehindCount += 1
+                case "2+ Behind": s.jamfMobileOsTwoPlusBehindCount += 1
+                default: break
                 }
             }
         }
@@ -1321,6 +1546,15 @@ extension ExportColumn {
         .init(id: "axmCoverageStatus",     label: "Coverage Status",         enabled: true),
         .init(id: "axmCoverageEndDate",    label: "Coverage End Date",       enabled: true),
         .init(id: "axmAgreementNumber",    label: "AppleCare Agreement #",   enabled: true),
+        .init(id: "axmWifiMacAddress",     label: "Wi-Fi MAC Address",       enabled: false),
+        .init(id: "axmBluetoothMacAddress", label: "Bluetooth MAC Address",  enabled: false),
+        .init(id: "axmEthernetMacAddress", label: "Ethernet MAC Address",    enabled: false),
+        .init(id: "axmImei",               label: "IMEI",                    enabled: false),
+        .init(id: "axmMeid",               label: "MEID",                    enabled: false),
+        .init(id: "axmEid",                label: "EID",                     enabled: false),
+        .init(id: "axmMdmMigrationCapable", label: "MDM Migration Capable",  enabled: false),
+        .init(id: "axmMdmMigrationStatus", label: "MDM Migration Status",    enabled: false),
+        .init(id: "axmMdmMigrationDeadline", label: "MDM Migration Deadline", enabled: false),
         .init(id: "axmPurchaseSource",     label: "Purchase Source",         enabled: true),
         .init(id: "wbStatus",              label: "Jamf Update Status",      enabled: true),
         .init(id: "wbPushedAt",            label: "Jamf Update Pushed At",   enabled: false),
@@ -1352,6 +1586,15 @@ extension Device {
         case "axmCoverageStatus":     return coverageStatus.label
         case "axmCoverageEndDate":    return axmCoverageEndDate
         case "axmAgreementNumber":    return axmAgreementNumber
+        case "axmWifiMacAddress":     return axmWifiMacAddress
+        case "axmBluetoothMacAddress": return axmBluetoothMacAddress
+        case "axmEthernetMacAddress": return axmEthernetMacAddress
+        case "axmImei":               return axmImei
+        case "axmMeid":               return axmMeid
+        case "axmEid":                return axmEid
+        case "axmMdmMigrationCapable": return axmMdmMigrationCapable
+        case "axmMdmMigrationStatus": return axmMdmMigrationStatus
+        case "axmMdmMigrationDeadline": return axmMdmMigrationDeadline
         case "axmPurchaseSource":     return axmPurchaseSource
         case "wbStatus":              return wbStatus?.label
         case "wbPushedAt":            return wbPushedAt

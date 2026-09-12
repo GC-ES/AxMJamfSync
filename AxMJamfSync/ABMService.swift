@@ -60,6 +60,9 @@ private struct ABMDeviceAttributes: Codable {
     let imei:                     [String]?
     let meid:                     [String]?
     let eid:                      String?
+    let isMdmMigrationCapable:    Bool?
+    let mdmMigrationStatus:       String?    // "REQUESTED" | "STARTED" | "SUCCESS" | "FAILED"
+    let mdmMigrationDeadlineDateTime: String?
 }
 
 /// Paginated list response
@@ -386,6 +389,15 @@ actor ABMService {
                     deviceModel:        record.attributes.deviceModel,
                     deviceClass:        record.attributes.deviceClass,
                     productFamily:      record.attributes.productFamily,
+                    wifiMacAddress:      record.attributes.wifiMacAddress?.isEmpty == false ? record.attributes.wifiMacAddress : nil,
+                    bluetoothMacAddress: record.attributes.bluetoothMacAddress?.isEmpty == false ? record.attributes.bluetoothMacAddress : nil,
+                    ethernetMacAddress:  record.attributes.ethernetMacAddress?.isEmpty == false ? record.attributes.ethernetMacAddress!.joined(separator: ", ") : nil,
+                    imei:                record.attributes.imei?.isEmpty == false ? record.attributes.imei!.joined(separator: ", ") : nil,
+                    meid:                record.attributes.meid?.isEmpty == false ? record.attributes.meid!.joined(separator: ", ") : nil,
+                    eid:                 record.attributes.eid?.isEmpty == false ? record.attributes.eid : nil,
+                    isMdmMigrationCapable: record.attributes.isMdmMigrationCapable.map { $0 ? "True" : "False" },
+                    mdmMigrationStatus:    record.attributes.mdmMigrationStatus,
+                    mdmMigrationDeadline:  record.attributes.mdmMigrationDeadlineDateTime,
                     rawJson:            recordJson
                 )
                 results.append(device)
@@ -845,6 +857,15 @@ struct RawABMDevice: Sendable {
     let deviceModel:        String?  // deviceModel e.g. "MacBook Pro 13\""
     let deviceClass:        String?
     let productFamily:      String?  // e.g. "Mac" | "iPad" | "iPhone" | "AppleTV" — drives Jamf endpoint routing
+    let wifiMacAddress:      String?
+    let bluetoothMacAddress: String?
+    let ethernetMacAddress:  String?  // joined ", " — ABM returns [String]
+    let imei:                String?  // joined ", " — ABM returns [String]
+    let meid:                String?  // joined ", " — ABM returns [String]
+    let eid:                 String?
+    let isMdmMigrationCapable: String?  // "True" | "False" — tri-state, nil = not yet populated by Apple
+    let mdmMigrationStatus:    String?  // "REQUESTED" | "STARTED" | "SUCCESS" | "FAILED"
+    let mdmMigrationDeadline:  String?  // raw ISO 8601 — never parsed to Date at this layer
     let rawJson:            Data?
 }
 

@@ -41,6 +41,16 @@ struct JamfDashboardContent: View {
       DonutSegment(label: "Never", value: fs.jamfCheckinNever, color: .red),
     ]
   }
+  private var architectureSegments: [DonutSegment] {
+    DonutChartView.segments(from: fs.jamfArchitectureBreakdown, palette: [.blue, .purple, .secondary])
+  }
+  private var certExpiringSegments: [DonutSegment] {
+    [
+      DonutSegment(label: "Next 30 Days", value: fs.jamfCertExpiring30, color: .red),
+      DonutSegment(label: "31–60 Days",   value: fs.jamfCertExpiring60, color: .orange),
+      DonutSegment(label: "61–90 Days",   value: fs.jamfCertExpiring90, color: .yellow),
+    ]
+  }
 
   // Every tap here must land on exactly the population the tapped number was
   // counted from — which is the facet-filtered set (fs), not the whole fleet.
@@ -50,15 +60,58 @@ struct JamfDashboardContent: View {
   // disagree whenever a dashboard facet was active.
   private func drillDown(deviceType: DeviceKind? = nil, jamfManaged: Bool? = nil,
                           osVersion: String? = nil, fileVault: String? = nil,
-                          checkin: String? = nil, expiringWindow: String? = nil) {
-    store.drillDown(source: expiringWindow != nil ? .both : nil,
+                          checkin: String? = nil, expiringWindow: String? = nil,
+                          coverage: CoverageStatus? = nil, certExpiringWindow: String? = nil,
+                          architecture: String? = nil, ram: String? = nil,
+                          osBehind: String? = nil) {
+    // Which population's "latest version" applies depends on which device type
+    // is being drilled into — a mobile tap must never be classified against
+    // macOS's latest, or vice versa (see the unified-versioning comment below).
+    let osBehindLatest: Int? = osBehind == nil ? nil : (deviceType == .mobile ? latestMobileOsVersion : latestMacOsVersion)
+    store.drillDown(source: (expiringWindow != nil || coverage != nil) ? .both : nil,
+                     coverage: coverage,
                      deviceType: deviceType ?? store.jamfDashboardDeviceTypeFacet,
                      jamfManaged: jamfManaged ?? store.jamfDashboardManagedFacet,
                      osVersion: osVersion,
                      fileVault: fileVault ?? store.jamfDashboardFileVaultFacet,
                      checkin: checkin ?? store.jamfDashboardCheckinFacet,
-                     expiringWindow: expiringWindow)
+                     expiringWindow: expiringWindow,
+                     certExpiringWindow: certExpiringWindow,
+                     architecture: architecture, ram: ram,
+                     osBehind: osBehind, osBehindLatestVersion: osBehindLatest)
     navigateToDevices()
+  }
+
+  // Captured once per render from the same facet-filtered `fs` every card reads —
+  // so a tap on an OS-behind bucket classifies devices against the exact same
+  // "latest version" that produced the tapped count (see AppStore.osBehindLabel).
+  // Computers and mobile devices are separate populations — mixing macOS 26 and
+  // iOS 26 under Apple's shared yearly version number would be meaningless.
+  private var latestMacOsVersion: Int? {
+    fs.jamfMacOsVersionBreakdown.keys.compactMap { Int($0) }.max()
+  }
+  private var latestMobileOsVersion: Int? {
+    fs.jamfMobileOsVersionBreakdown.keys.compactMap { Int($0) }.max()
+  }
+  // Version-numbered titles for the OS-currency stat row — falls back to the
+  // plain relative label if no device has a parseable OS version yet.
+  private var currentVersionTitle: String {
+    latestMacOsVersion.map { "Current (\($0))" } ?? "Current"
+  }
+  private var oneBehindVersionTitle: String {
+    latestMacOsVersion.map { "N-1 (\($0 - 1))" } ?? "N-1"
+  }
+  private var twoBehindVersionTitle: String {
+    latestMacOsVersion.map { "N-2 (\($0 - 2))" } ?? "N-2"
+  }
+  private var currentMobileVersionTitle: String {
+    latestMobileOsVersion.map { "Current (\($0))" } ?? "Current"
+  }
+  private var oneBehindMobileVersionTitle: String {
+    latestMobileOsVersion.map { "N-1 (\($0 - 1))" } ?? "N-1"
+  }
+  private var twoBehindMobileVersionTitle: String {
+    latestMobileOsVersion.map { "N-2 (\($0 - 2))" } ?? "N-2"
   }
 
   var body: some View {
@@ -124,50 +177,15 @@ struct JamfDashboardContent: View {
         .padding(.horizontal, 24)
       }
 
-      // MARK: Device type mix
-      CardSection(title: "Device Type", icon: "laptopcomputer") {
-        HStack(spacing: 64) {
-          DonutChartView(segments: deviceTypeSegments, centerTitle: "\(fs.jamfComputerCount + fs.jamfMobileCount)", centerSubtitle: "devices")
-            .frame(width: 160, height: 160)
-          VStack(alignment: .leading, spacing: 16) {
-            ForEach(deviceTypeSegments) { seg in
-              DashboardDrillDown(action: { drillDown(deviceType: seg.label == "Computers" ? .mac : .mobile) }) {
-                CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
-              }
-            }
-          }
-          Spacer()
-        }
-        .padding(.vertical, 8)
-      }
-      .padding(.horizontal, 24)
-
-      // MARK: OS Version — split by device type, only shown for types actually present
+      // MARK: Device Type + Check-in Freshness — same row.
       HStack(alignment: .top, spacing: 16) {
-        if fs.jamfComputerCount > 0 {
-          CardSection(title: "macOS Version", icon: "cpu") {
-            BreakdownBarChart(breakdown: fs.jamfMacOsVersionBreakdown, color: .blue, sortMode: .byVersionDescending,
-                               onTapRow: { ver in drillDown(deviceType: .mac, osVersion: ver) })
-          }
-        }
-        if fs.jamfMobileCount > 0 {
-          CardSection(title: "Mobile OS Version", icon: "cpu") {
-            BreakdownBarChart(breakdown: fs.jamfMobileOsVersionBreakdown, color: .purple, sortMode: .byVersionDescending,
-                               onTapRow: { ver in drillDown(deviceType: .mobile, osVersion: ver) })
-          }
-        }
-      }
-      .padding(.horizontal, 24)
-
-      // MARK: FileVault encryption — computers only
-      if fs.jamfComputerCount > 0 {
-        CardSection(title: "FileVault Encryption", icon: "lock.shield.fill") {
+        CardSection(title: "Device Type", icon: "laptopcomputer") {
           HStack(spacing: 64) {
-            DonutChartView(segments: fileVaultSegments, centerTitle: "\(fs.jamfComputerCount)", centerSubtitle: "Macs")
+            DonutChartView(segments: deviceTypeSegments, centerTitle: "\(fs.jamfComputerCount + fs.jamfMobileCount)", centerSubtitle: "devices")
               .frame(width: 160, height: 160)
             VStack(alignment: .leading, spacing: 16) {
-              ForEach(fileVaultSegments) { seg in
-                DashboardDrillDown(action: { drillDown(deviceType: .mac, fileVault: seg.label) }) {
+              ForEach(deviceTypeSegments) { seg in
+                DashboardDrillDown(action: { drillDown(deviceType: seg.label == "Computers" ? .mac : .mobile) }) {
                   CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
                 }
               }
@@ -176,32 +194,161 @@ struct JamfDashboardContent: View {
           }
           .padding(.vertical, 8)
         }
-        .padding(.horizontal, 24)
-      }
-
-      // MARK: Check-in freshness
-      CardSection(title: "Check-in Freshness", icon: "antenna.radiowaves.left.and.right") {
-        HStack(spacing: 64) {
-          DonutChartView(segments: checkinSegments, centerTitle: "\(fs.jamfComputerCount + fs.jamfMobileCount)", centerSubtitle: "devices")
-            .frame(width: 160, height: 160)
-          VStack(alignment: .leading, spacing: 16) {
-            ForEach(checkinSegments) { seg in
-              DashboardDrillDown(action: { drillDown(checkin: seg.label) }) {
-                CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
+        CardSection(title: "Check-in Freshness", icon: "antenna.radiowaves.left.and.right") {
+          HStack(spacing: 64) {
+            DonutChartView(segments: checkinSegments, centerTitle: "\(fs.jamfComputerCount + fs.jamfMobileCount)", centerSubtitle: "devices")
+              .frame(width: 160, height: 160)
+            VStack(alignment: .leading, spacing: 16) {
+              ForEach(checkinSegments) { seg in
+                DashboardDrillDown(action: { drillDown(checkin: seg.label) }) {
+                  CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
+                }
               }
             }
+            Spacer()
           }
-          Spacer()
+          .padding(.vertical, 8)
         }
-        .padding(.vertical, 8)
       }
       .padding(.horizontal, 24)
 
-      // MARK: Sync status
-      CardSection(title: "Jamf Pro", icon: "server.rack") {
-        SyncTimestampRow(label: "Last sync", timestamp: s.lastJamfSync)
-        if s.runJamfFetched > 0 {
-          DashStatRow(label: "Fetched this run", value: s.runJamfFetched, color: .blue)
+      // MARK: Hardware — reverted back to one combined card (architecture + RAM
+      // together), below the Device Type row.
+      if fs.jamfComputerCount > 0 {
+        CardSection(title: "Hardware", icon: "cpu.fill") {
+          HStack(alignment: .top, spacing: 32) {
+            HStack(spacing: 32) {
+              DonutChartView(segments: architectureSegments, centerTitle: "\(fs.jamfComputerCount)", centerSubtitle: "Macs")
+                .frame(width: 140, height: 140)
+              VStack(alignment: .leading, spacing: 12) {
+                ForEach(architectureSegments) { seg in
+                  DashboardDrillDown(action: { drillDown(deviceType: .mac, architecture: seg.label) }) {
+                    CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
+                  }
+                }
+              }
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+              Text("RAM (GB)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+              BreakdownBarChart(breakdown: fs.jamfRamBreakdown, color: .blue, sortMode: .byVersionDescending,
+                                 onTapRow: { ram in drillDown(deviceType: .mac, ram: ram) })
+            }
+            Spacer()
+          }
+          .padding(.vertical, 8)
+        }
+        .padding(.horizontal, 24)
+      }
+
+      // MARK: OS Version — split by device type, only shown for types actually present
+      HStack(alignment: .top, spacing: 16) {
+        if fs.jamfComputerCount > 0 {
+          CardSection(title: "macOS Version", icon: "cpu") {
+            VStack(alignment: .leading, spacing: 16) {
+              // "N behind" framing — the newest version actually present in this
+              // population is "Current," computed fresh every time (never a
+              // hardcoded target), so this never goes stale as new macOS versions ship.
+              HStack(spacing: 12) {
+                DashboardDrillDown(action: { drillDown(deviceType: .mac, osBehind: "Current") }) {
+                  CoverageStatCard(title: currentVersionTitle, value: fs.jamfOsCurrentCount, total: fs.jamfComputerCount,
+                                   icon: "checkmark.circle.fill", color: .green)
+                }
+                DashboardDrillDown(action: { drillDown(deviceType: .mac, osBehind: "1 Behind") }) {
+                  CoverageStatCard(title: oneBehindVersionTitle, value: fs.jamfOsOneBehindCount, total: fs.jamfComputerCount,
+                                   icon: "clock.badge.exclamationmark", color: .orange)
+                }
+                DashboardDrillDown(action: { drillDown(deviceType: .mac, osBehind: "2+ Behind") }) {
+                  CoverageStatCard(title: twoBehindVersionTitle, value: fs.jamfOsTwoPlusBehindCount, total: fs.jamfComputerCount,
+                                   icon: "exclamationmark.triangle.fill", color: .red,
+                                   tooltip: InfoContent(
+                                     icon: "exclamationmark.triangle.fill", title: "2+ Major Versions Behind",
+                                     summary: "These Macs are two or more major macOS versions behind the newest version currently seen in your fleet — \"N-2\" labels the boundary, but this bucket includes anything further behind too.",
+                                     bullets: ["\"Current\" is whatever the newest version actually present is — not a fixed target — so this stays accurate as new macOS versions ship.",
+                                               "Worth prioritizing for OS-upgrade planning, especially if they're also outside AppleCare/warranty."]))
+                }
+              }
+              Divider()
+              BreakdownBarChart(breakdown: fs.jamfMacOsVersionBreakdown, color: .blue, sortMode: .byVersionDescending,
+                                 onTapRow: { ver in drillDown(deviceType: .mac, osVersion: ver) })
+            }
+          }
+        }
+        if fs.jamfMobileCount > 0 {
+          CardSection(title: "Mobile OS Version", icon: "cpu") {
+            VStack(alignment: .leading, spacing: 16) {
+              // Same "N behind" framing as macOS, against iOS/iPadOS/tvOS/visionOS's
+              // own latest — never mixed with macOS's latest (see the unified-
+              // versioning comment on latestMacOsVersion/latestMobileOsVersion).
+              HStack(spacing: 12) {
+                DashboardDrillDown(action: { drillDown(deviceType: .mobile, osBehind: "Current") }) {
+                  CoverageStatCard(title: currentMobileVersionTitle, value: fs.jamfMobileOsCurrentCount, total: fs.jamfMobileCount,
+                                   icon: "checkmark.circle.fill", color: .green)
+                }
+                DashboardDrillDown(action: { drillDown(deviceType: .mobile, osBehind: "1 Behind") }) {
+                  CoverageStatCard(title: oneBehindMobileVersionTitle, value: fs.jamfMobileOsOneBehindCount, total: fs.jamfMobileCount,
+                                   icon: "clock.badge.exclamationmark", color: .orange)
+                }
+                DashboardDrillDown(action: { drillDown(deviceType: .mobile, osBehind: "2+ Behind") }) {
+                  CoverageStatCard(title: twoBehindMobileVersionTitle, value: fs.jamfMobileOsTwoPlusBehindCount, total: fs.jamfMobileCount,
+                                   icon: "exclamationmark.triangle.fill", color: .red,
+                                   tooltip: InfoContent(
+                                     icon: "exclamationmark.triangle.fill", title: "2+ Major Versions Behind",
+                                     summary: "These mobile devices are two or more major OS versions behind the newest version currently seen in your fleet — \"N-2\" labels the boundary, but this bucket includes anything further behind too.",
+                                     bullets: ["\"Current\" is whatever the newest version actually present is — not a fixed target — so this stays accurate as new iOS/iPadOS versions ship.",
+                                               "Worth prioritizing for OS-upgrade planning, especially if they're also outside AppleCare/warranty."]))
+                }
+              }
+              Divider()
+              BreakdownBarChart(breakdown: fs.jamfMobileOsVersionBreakdown, color: .purple, sortMode: .byVersionDescending,
+                                 onTapRow: { ver in drillDown(deviceType: .mobile, osVersion: ver) })
+            }
+          }
+        }
+      }
+      .padding(.horizontal, 24)
+
+      // MARK: FileVault + MDM Cert Expiring — same row.
+      HStack(alignment: .top, spacing: 16) {
+        if fs.jamfComputerCount > 0 {
+          CardSection(title: "FileVault Encryption", icon: "lock.shield.fill") {
+            HStack(spacing: 64) {
+              DonutChartView(segments: fileVaultSegments, centerTitle: "\(fs.jamfComputerCount)", centerSubtitle: "Macs")
+                .frame(width: 160, height: 160)
+              VStack(alignment: .leading, spacing: 16) {
+                ForEach(fileVaultSegments) { seg in
+                  DashboardDrillDown(action: { drillDown(deviceType: .mac, fileVault: seg.label) }) {
+                    CoverageLegendRow(label: seg.label, value: seg.value, color: seg.color)
+                  }
+                }
+              }
+              Spacer()
+            }
+            .padding(.vertical, 8)
+          }
+        }
+        CardSection(title: "MDM Cert Expiring", icon: "checkmark.seal.fill") {
+          HStack(spacing: 64) {
+            DonutChartView(segments: certExpiringSegments,
+                            centerTitle: "\(fs.jamfCertExpiring30 + fs.jamfCertExpiring60 + fs.jamfCertExpiring90)",
+                            centerSubtitle: "expiring")
+              .frame(width: 160, height: 160)
+            VStack(alignment: .leading, spacing: 16) {
+              DashboardDrillDown(action: { drillDown(certExpiringWindow: "0–30") }) {
+                CoverageLegendRow(label: "Next 30 Days", value: fs.jamfCertExpiring30, color: .red)
+              }
+              DashboardDrillDown(action: { drillDown(certExpiringWindow: "31–60") }) {
+                CoverageLegendRow(label: "31–60 Days", value: fs.jamfCertExpiring60, color: .orange)
+              }
+              DashboardDrillDown(action: { drillDown(certExpiringWindow: "61–90") }) {
+                CoverageLegendRow(label: "61–90 Days", value: fs.jamfCertExpiring90, color: .yellow)
+              }
+            }
+            Spacer()
+          }
+          .padding(.vertical, 8)
         }
       }
       .padding(.horizontal, 24)
@@ -218,10 +365,18 @@ struct JamfDashboardContent: View {
                               noPlan: fs.jamfCoverageNoPlan, neverFetched: fs.jamfCoverageNeverFetched)
               .frame(width: 220, height: 220)
             VStack(alignment: .leading, spacing: 16) {
-              CoverageLegendRow(label: "In Warranty",      value: fs.jamfCoverageActive,       color: .green)
-              CoverageLegendRow(label: "Out of Warranty",  value: fs.jamfCoverageInactive,     color: .red)
-              CoverageLegendRow(label: "No Coverage Info", value: fs.jamfCoverageNoPlan,       color: .orange)
-              CoverageLegendRow(label: "Never Fetched",    value: fs.jamfCoverageNeverFetched, color: .secondary)
+              DashboardDrillDown(action: { drillDown(coverage: .active) }) {
+                CoverageLegendRow(label: "In Warranty",      value: fs.jamfCoverageActive,       color: .green,     total: fs.both)
+              }
+              DashboardDrillDown(action: { drillDown(coverage: .inactive) }) {
+                CoverageLegendRow(label: "Out of Warranty",  value: fs.jamfCoverageInactive,     color: .red,       total: fs.both)
+              }
+              DashboardDrillDown(action: { drillDown(coverage: .noCoverage) }) {
+                CoverageLegendRow(label: "No Coverage Info", value: fs.jamfCoverageNoPlan,       color: .orange,    total: fs.both)
+              }
+              DashboardDrillDown(action: { drillDown(coverage: .notFetched) }) {
+                CoverageLegendRow(label: "Never Fetched",    value: fs.jamfCoverageNeverFetched, color: .secondary, total: fs.both)
+              }
             }
             Spacer()
           }
@@ -229,6 +384,15 @@ struct JamfDashboardContent: View {
         }
         .padding(.horizontal, 24)
       }
+
+      // MARK: Sync status — moved to the very end, below Coverage Distribution.
+      CardSection(title: "Jamf Pro", icon: "server.rack") {
+        SyncTimestampRow(label: "Last sync", timestamp: s.lastJamfSync)
+        if s.runJamfFetched > 0 {
+          DashStatRow(label: "Fetched this run", value: s.runJamfFetched, color: .blue)
+        }
+      }
+      .padding(.horizontal, 24)
     }
   }
 }

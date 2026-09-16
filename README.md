@@ -68,6 +68,9 @@ v2.5 expands every dashboard focus mode with new cards built on AxM device data 
 **Reliability**
 - Fixed a Core Data migration bug ("Persistent store migration failed, missing mapping model") that could prevent the app from opening its device database on launch. Your data was never at risk — the app safely refuses to open an incompatible store rather than touching it — but this is now fixed at the root: the Core Data model is properly versioned so every future schema change carries a safe migration path
 
+**Diagnostics**
+- Help → Export Diagnostics… now masks every device serial number in the bundled log files, replacing each with a consistent `<device N>` placeholder — the same serial reads as the same placeholder everywhere in the bundle, so a diagnostics zip can be shared for troubleshooting without exposing your org's device inventory
+
 ### Upgrade Notes
 No action required. Existing credentials, cache, and preferences carry over unchanged; the Core Data schema updates transparently on first launch.
 

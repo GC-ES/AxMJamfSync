@@ -59,6 +59,20 @@ final class PersistenceController: Sendable {
         return ctx
     }
 
+    /// Every device serial number in this store — single-column dictionary fetch,
+    /// no object faulting. Used by DiagnosticsExporter to mask serials before a
+    /// log file leaves the Mac in a shared bundle.
+    func allSerialNumbers() -> [String] {
+        let ctx = newBackgroundContext()
+        return ctx.performAndWait {
+            let req = NSFetchRequest<NSDictionary>(entityName: "CDDevice")
+            req.resultType = .dictionaryResultType
+            req.propertiesToFetch = ["serialNumber"]
+            let rows = (try? ctx.fetch(req)) ?? []
+            return rows.compactMap { $0["serialNumber"] as? String }
+        }
+    }
+
     // MARK: - Init
 
     /// Default init — uses legacy single-env store (AxMJamfSync.sqlite).

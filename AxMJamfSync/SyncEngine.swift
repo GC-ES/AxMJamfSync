@@ -1709,6 +1709,15 @@ private func mergeDevicesOffActor(
                     axmCoverageEndDate:   d.axmCoverageEndDate,
                     axmCoverageFetchedAt: d.axmCoverageFetchedAt,
                     axmAgreementNumber:   d.axmAgreementNumber,
+                    axmWifiMacAddress:    d.axmWifiMacAddress,
+                    axmBluetoothMacAddress: d.axmBluetoothMacAddress,
+                    axmEthernetMacAddress: d.axmEthernetMacAddress,
+                    axmImei:              d.axmImei,
+                    axmMeid:              d.axmMeid,
+                    axmEid:               d.axmEid,
+                    axmMdmMigrationCapable: d.axmMdmMigrationCapable,
+                    axmMdmMigrationStatus: d.axmMdmMigrationStatus,
+                    axmMdmMigrationDeadline: d.axmMdmMigrationDeadline,
                     wbStatus:             d.wbStatus,
                     wbPushedAt:           d.wbPushedAt,
                     wbNote:               d.wbNote,
@@ -1781,6 +1790,15 @@ private func mergeDevicesOffActor(
                 axmCoverageEndDate:   ex?.axmCoverageEndDate,
                 axmCoverageFetchedAt: ex?.axmCoverageFetchedAt,
                 axmAgreementNumber:   ex?.axmAgreementNumber,
+                axmWifiMacAddress:    d.wifiMacAddress      ?? ex?.axmWifiMacAddress,
+                axmBluetoothMacAddress: d.bluetoothMacAddress ?? ex?.axmBluetoothMacAddress,
+                axmEthernetMacAddress: d.ethernetMacAddress  ?? ex?.axmEthernetMacAddress,
+                axmImei:              d.imei                ?? ex?.axmImei,
+                axmMeid:              d.meid                ?? ex?.axmMeid,
+                axmEid:               d.eid                 ?? ex?.axmEid,
+                axmMdmMigrationCapable: d.isMdmMigrationCapable ?? ex?.axmMdmMigrationCapable,
+                axmMdmMigrationStatus: d.mdmMigrationStatus  ?? ex?.axmMdmMigrationStatus,
+                axmMdmMigrationDeadline: d.mdmMigrationDeadline ?? ex?.axmMdmMigrationDeadline,
                 // wbStatus rules for the ABM loop:
                 //   axmOnly  → nil (no Jamf record to PATCH; avoids false "Pending" in dashboard)
                 //   .both, genuinely new match (was jamfOnly before) → .pending (first-time write)
@@ -1938,6 +1956,15 @@ private func mergeDevicesOffActor(
                     axmCoverageEndDate:   ex?.axmCoverageEndDate,
                     axmCoverageFetchedAt: ex?.axmCoverageFetchedAt,
                     axmAgreementNumber:   ex?.axmAgreementNumber,
+                    axmWifiMacAddress:    ex?.axmWifiMacAddress,
+                    axmBluetoothMacAddress: ex?.axmBluetoothMacAddress,
+                    axmEthernetMacAddress: ex?.axmEthernetMacAddress,
+                    axmImei:              ex?.axmImei,
+                    axmMeid:              ex?.axmMeid,
+                    axmEid:               ex?.axmEid,
+                    axmMdmMigrationCapable: ex?.axmMdmMigrationCapable,
+                    axmMdmMigrationStatus: ex?.axmMdmMigrationStatus,
+                    axmMdmMigrationDeadline: ex?.axmMdmMigrationDeadline,
                     wbStatus:             ex?.wbStatus,
                     wbPushedAt:           ex?.wbPushedAt,
                     wbNote:               ex?.wbNote,
@@ -2056,6 +2083,15 @@ private func mergeDevicesOffActor(
                     axmCoverageEndDate:   ex?.axmCoverageEndDate,
                     axmCoverageFetchedAt: ex?.axmCoverageFetchedAt,
                     axmAgreementNumber:   ex?.axmAgreementNumber,
+                    axmWifiMacAddress:    ex?.axmWifiMacAddress,
+                    axmBluetoothMacAddress: ex?.axmBluetoothMacAddress,
+                    axmEthernetMacAddress: ex?.axmEthernetMacAddress,
+                    axmImei:              ex?.axmImei,
+                    axmMeid:              ex?.axmMeid,
+                    axmEid:               ex?.axmEid,
+                    axmMdmMigrationCapable: ex?.axmMdmMigrationCapable,
+                    axmMdmMigrationStatus: ex?.axmMdmMigrationStatus,
+                    axmMdmMigrationDeadline: ex?.axmMdmMigrationDeadline,
                     wbStatus:             ex?.wbStatus,
                     wbPushedAt:           ex?.wbPushedAt,
                     wbNote:               ex?.wbNote,
@@ -2126,6 +2162,15 @@ private struct SyncDevice {
     var axmCoverageEndDate:   String?
     var axmCoverageFetchedAt: String?
     var axmAgreementNumber:   String?
+    var axmWifiMacAddress:      String?
+    var axmBluetoothMacAddress: String?
+    var axmEthernetMacAddress:  String?
+    var axmImei:                String?
+    var axmMeid:                String?
+    var axmEid:                 String?
+    var axmMdmMigrationCapable: String?
+    var axmMdmMigrationStatus:  String?
+    var axmMdmMigrationDeadline: String?
     var wbStatus:             WBStatus?
     var wbPushedAt:           String?   // Fix #1: carry push timestamp through merge
     var wbNote:               String?   // Fix #1: carry note through merge
@@ -2177,6 +2222,15 @@ private struct SyncDevice {
             axmCoverageEndDate:   axmCoverageEndDate,
             axmCoverageFetchedAt: axmCoverageFetchedAt,
             axmAgreementNumber:   axmAgreementNumber,
+            axmWifiMacAddress:    axmWifiMacAddress,
+            axmBluetoothMacAddress: axmBluetoothMacAddress,
+            axmEthernetMacAddress: axmEthernetMacAddress,
+            axmImei:              axmImei,
+            axmMeid:              axmMeid,
+            axmEid:               axmEid,
+            axmMdmMigrationCapable: axmMdmMigrationCapable,
+            axmMdmMigrationStatus: axmMdmMigrationStatus,
+            axmMdmMigrationDeadline: axmMdmMigrationDeadline,
             wbStatus:             wbStatus,
             wbPushedAt:           wbPushedAt,
             wbNote:               wbNote,

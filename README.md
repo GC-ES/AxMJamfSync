@@ -41,6 +41,41 @@ The result: every device record in Jamf Pro shows accurate, up-to-date warranty 
 
 ---
 
+## What's new in v2.5 — Richer Dashboards, More AxM Device Data & a Core Data Fix
+
+v2.5 expands every dashboard focus mode with new cards built on AxM device data that had been decoded for a while but never surfaced, and fixes a real Core Data migration bug that could block the app from opening its device database.
+
+**New AxM device data**
+- Wi-Fi, Bluetooth, and Ethernet MAC addresses, IMEI, MEID, and EID are now structured, queryable fields — previously visible only in the device detail sheet's raw JSON. Available as CSV export columns (off by default; enable them under Export → Columns)
+- Apple's MDM migration fields — capability, status, and deadline — are now fully wired through and power the new dashboard cards below
+
+**Apple (AxM) dashboard**
+- New **MDM Migration Status** card — Not Requested / Requested / In Progress / Success / Failed, each its own stat tile rather than a donut slice, so a real-but-small count (e.g. 4 of 1,325) never renders as an invisible sliver
+- A **Deadline Approaching** row (Next 30 / 31–60 / 61–90 Days) appears once any device has an in-progress migration with a live deadline
+- **MDM Migration Capability** now sits alongside **MDM Assignment**
+- **Coverage Distribution**'s legend rows are tappable now and show a percentage next to each count
+- Last-sync status moved to the bottom of the dashboard, below Coverage Distribution
+
+**Jamf Pro dashboard**
+- New **MDM Cert Expiring** card (Next 30 / 31–60 / 61–90 Days) — the MDM enrollment certificate expiration date was already being fetched but had no dashboard presence until now
+- New **Hardware** card — Apple Silicon vs. Intel, plus a RAM breakdown
+- **macOS and iOS/iPadOS version cards** now show currency at a glance as **Current (N) / N-1 / N-2**, computed from whichever version is actually newest in your fleet — never a hardcoded target, so it can't go stale as Apple ships new versions
+- Layout reorganized: Device Type + Check-in Freshness share a row, FileVault + MDM Cert Expiring share a row, Hardware sits below Device Type; last-sync status moved to the bottom
+
+**Default dashboard**
+- Coverage Distribution's legend rows are tappable now and show a percentage next to each count
+
+**Reliability**
+- Fixed a Core Data migration bug ("Persistent store migration failed, missing mapping model") that could prevent the app from opening its device database on launch. Your data was never at risk — the app safely refuses to open an incompatible store rather than touching it — but this is now fixed at the root: the Core Data model is properly versioned so every future schema change carries a safe migration path
+
+**Diagnostics**
+- Help → Export Diagnostics… now masks every device serial number in the bundled log files, replacing each with a consistent `<device N>` placeholder — the same serial reads as the same placeholder everywhere in the bundle, so a diagnostics zip can be shared for troubleshooting without exposing your org's device inventory
+
+### Upgrade Notes
+No action required. Existing credentials, cache, and preferences carry over unchanged; the Core Data schema updates transparently on first launch.
+
+---
+
 ## What's new in v2.4 — Dashboard Focus Modes & Reliability
 
 v2.4 splits the Dashboard into focused views, closes several data-integrity gaps found during a deep architecture review, and polishes Setup, Sync, Devices, Export, and the environment sidebar.

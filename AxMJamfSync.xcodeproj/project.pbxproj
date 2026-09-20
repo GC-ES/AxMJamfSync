@@ -57,7 +57,11 @@
 		A012 /* DevicesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DevicesView.swift; sourceTree = "<group>"; };
 		A013 /* ExportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExportView.swift; sourceTree = "<group>"; };
 		A014 /* SyncPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncPanelView.swift; sourceTree = "<group>"; };
-		A015 /* AxMJamfSync.xcdatamodeld */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = AxMJamfSync.xcdatamodeld; sourceTree = "<group>"; };
+		A035 /* AxMJamfSync.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = AxMJamfSync.xcdatamodel; sourceTree = "<group>"; };
+		A036 /* AxMJamfSync 2.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "AxMJamfSync 2.xcdatamodel"; sourceTree = "<group>"; };
+		A037 /* AxMJamfSync 3.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "AxMJamfSync 3.xcdatamodel"; sourceTree = "<group>"; };
+		A038 /* AxMJamfSync 4.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "AxMJamfSync 4.xcdatamodel"; sourceTree = "<group>"; };
+		A039 /* AxMJamfSync 5.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "AxMJamfSync 5.xcdatamodel"; sourceTree = "<group>"; };
 		A016 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A017 /* AxMJamfSync.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AxMJamfSync.entitlements; sourceTree = "<group>"; };
 		A018 /* ABMService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ABMService.swift; sourceTree = "<group>"; };
@@ -376,7 +380,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 2.4;
+				MARKETING_VERSION = 2.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.karthikmac.axmjamfsync;
 				PRODUCT_NAME = "AxM Jamf Sync";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -406,7 +410,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 2.4;
+				MARKETING_VERSION = 2.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.karthikmac.axmjamfsync;
 				PRODUCT_NAME = "AxM Jamf Sync";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -437,6 +441,23 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCVersionGroup section */
+		A015 /* AxMJamfSync.xcdatamodeld */ = {
+			isa = XCVersionGroup;
+			children = (
+				A035 /* AxMJamfSync.xcdatamodel */,
+				A036 /* AxMJamfSync 2.xcdatamodel */,
+				A037 /* AxMJamfSync 3.xcdatamodel */,
+				A038 /* AxMJamfSync 4.xcdatamodel */,
+				A039 /* AxMJamfSync 5.xcdatamodel */,
+			);
+			currentVersion = A039 /* AxMJamfSync 5.xcdatamodel */;
+			path = AxMJamfSync.xcdatamodeld;
+			sourceTree = "<group>";
+			versionGroupType = wrapper.xcdatamodel;
+		};
+/* End XCVersionGroup section */
 	};
 	rootObject = PROJ /* Project object */;
 }

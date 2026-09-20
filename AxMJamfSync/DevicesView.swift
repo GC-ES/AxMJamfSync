@@ -917,6 +917,9 @@ struct DeviceDetailPanel: View {
             ("imei",                    arrayFields["imei"]),
             ("meid",                    arrayFields["meid"]),
             ("eid",                     orgAttrs["eid"]?.isEmpty == false ? orgAttrs["eid"] : nil),
+            ("isMdmMigrationCapable",   orgAttrs["isMdmMigrationCapable"]),
+            ("mdmMigrationStatus",      orgAttrs["mdmMigrationStatus"]),
+            ("mdmMigrationDeadlineDateTime", orgAttrs["mdmMigrationDeadlineDateTime"]),
         ]
         return orderedKeys.compactMap { label, value in
             guard let v = value, !v.isEmpty else { return nil }

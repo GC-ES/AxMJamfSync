@@ -358,79 +358,6 @@ struct CommonDashboardContent: View {
                     .padding(.horizontal, 24)
                 }
 
-                // MARK: Coverage breakdown — full-width
-                CardSection(title: "Apple Warranty Status", icon: "shield.lefthalf.filled") {
-                    HStack(spacing: 12) {
-                        DashboardDrillDown(action: { drillDown(coverage: .active) }) {
-                            CoverageStatCard(
-                                title:    "In Warranty",
-                                value:    fs.coverageActive,
-                                total:    fs.axmTotal,
-                                icon:     "checkmark.shield.fill",
-                                color:    .green
-                            )
-                        }
-                        DashboardDrillDown(action: { drillDown(coverage: .inactive) }) {
-                            CoverageStatCard(
-                                title:    "Out of Warranty",
-                                value:    fs.coverageInactive,
-                                total:    fs.axmTotal,
-                                icon:     "xmark.shield.fill",
-                                color:    .red
-                            )
-                        }
-                        DashboardDrillDown(action: { drillDown(coverage: .noCoverage) }) {
-                            CoverageStatCard(
-                                title:    "No Coverage Info",
-                                value:    fs.coverageNoPlan,
-                                total:    fs.axmTotal,
-                                icon:     "questionmark.circle.fill",
-                                color:    .orange,
-                                tooltip:  InfoContent(
-                                icon:    "questionmark.circle.fill",
-                                title:   "No Coverage Info",
-                                summary: "Apple has no warranty or AppleCare record on file for these devices.",
-                                bullets: [
-                                    "Common for older devices past their original warranty period.",
-                                    "Can happen for devices bought through a third-party reseller not linked to your \(scopeAbbrev) account.",
-                                    "Devices not registered under your Apple Business/School Manager account may also show this."
-                                ]
-                            )
-                            )
-                        }
-                        DashboardDrillDown(action: { drillDown(coverage: .notFetched) }) {
-                            CoverageStatCard(
-                                title:    "Never Fetched",
-                                value:    fs.coverageNeverFetched,
-                                total:    fs.axmTotal,
-                                icon:     "clock.arrow.circlepath",
-                                color:    .secondary,
-                                tooltip:  InfoContent(
-                                icon:    "clock.badge.questionmark",
-                                title:   "Never Fetched",
-                                summary: "Warranty coverage has not been checked for these devices yet.",
-                                bullets: [
-                                    "Run a sync to retrieve their warranty status from Apple.",
-                                    "This count goes down each time a sync completes.",
-                                    "New devices added to \(scopeAbbrev) will appear here until their first coverage check."
-                                ]
-                            )
-                            )
-                        }
-                    }
-                    Divider()
-                    HStack {
-                        SyncTimestampRow(label: "Last coverage sync", timestamp: s.lastCoverageSync)
-                        Spacer()
-                        if s.runCovFetched > 0 {
-                            Text("\(s.runCovFetched) fetched this run")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.horizontal, 24)
-
                 // MARK: Expiring Soon — active coverage only, bucketed by days until
                 // axmCoverageEndDate. Non-overlapping windows so the three counts can
                 // be read individually without double-counting a device across cards.
@@ -484,10 +411,18 @@ struct CommonDashboardContent: View {
                             .frame(width: 300, height: 300)
 
                         VStack(alignment: .leading, spacing: 24) {
-                            CoverageLegendRow(label: "In Warranty",      value: fs.coverageActive,       color: .green)
-                            CoverageLegendRow(label: "Out of Warranty",  value: fs.coverageInactive,     color: .red)
-                            CoverageLegendRow(label: "No Coverage Info", value: fs.coverageNoPlan,       color: .orange)
-                            CoverageLegendRow(label: "Never Fetched",    value: fs.coverageNeverFetched, color: .secondary)
+                            DashboardDrillDown(action: { drillDown(coverage: .active) }) {
+                                CoverageLegendRow(label: "In Warranty",      value: fs.coverageActive,       color: .green,     total: fs.axmTotal)
+                            }
+                            DashboardDrillDown(action: { drillDown(coverage: .inactive) }) {
+                                CoverageLegendRow(label: "Out of Warranty",  value: fs.coverageInactive,     color: .red,       total: fs.axmTotal)
+                            }
+                            DashboardDrillDown(action: { drillDown(coverage: .noCoverage) }) {
+                                CoverageLegendRow(label: "No Coverage Info", value: fs.coverageNoPlan,       color: .orange,    total: fs.axmTotal)
+                            }
+                            DashboardDrillDown(action: { drillDown(coverage: .notFetched) }) {
+                                CoverageLegendRow(label: "Never Fetched",    value: fs.coverageNeverFetched, color: .secondary, total: fs.axmTotal)
+                            }
                         }
                         .frame(minWidth: 260)
 
@@ -495,6 +430,16 @@ struct CommonDashboardContent: View {
                     }
                     .padding(.vertical, 24)
                     .frame(minHeight: 340)
+                    Divider()
+                    HStack {
+                        SyncTimestampRow(label: "Last coverage sync", timestamp: s.lastCoverageSync)
+                        Spacer()
+                        if s.runCovFetched > 0 {
+                            Text("\(s.runCovFetched) fetched this run")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 .padding(.horizontal, 24)
         }
@@ -930,6 +875,13 @@ struct CoverageLegendRow: View {
     let label: String
     let value: Int
     let color: Color
+    var total: Int? = nil   // when set, shows "N%" of total next to the count
+
+    private var percentageText: String? {
+        guard let total, total > 0 else { return nil }
+        let pct = Int((Double(value) / Double(total) * 100).rounded())
+        return "\(pct)%"
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -944,6 +896,11 @@ struct CoverageLegendRow: View {
                 .fontWeight(.semibold)
                 .monospacedDigit()
                 .foregroundStyle(color)
+            if let percentageText {
+                Text("(\(percentageText))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

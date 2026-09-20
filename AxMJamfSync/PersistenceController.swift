@@ -59,6 +59,20 @@ final class PersistenceController: Sendable {
         return ctx
     }
 
+    /// Every device serial number in this store — single-column dictionary fetch,
+    /// no object faulting. Used by DiagnosticsExporter to mask serials before a
+    /// log file leaves the Mac in a shared bundle.
+    func allSerialNumbers() -> [String] {
+        let ctx = newBackgroundContext()
+        return ctx.performAndWait {
+            let req = NSFetchRequest<NSDictionary>(entityName: "CDDevice")
+            req.resultType = .dictionaryResultType
+            req.propertiesToFetch = ["serialNumber"]
+            let rows = (try? ctx.fetch(req)) ?? []
+            return rows.compactMap { $0["serialNumber"] as? String }
+        }
+    }
+
     // MARK: - Init
 
     /// Default init — uses legacy single-env store (AxMJamfSync.sqlite).
@@ -616,6 +630,17 @@ extension CDDevice {
         axmCoverageStatus   = d.axmCoverageStatus
         axmCoverageEndDate  = d.axmCoverageEndDate
         axmAgreementNumber  = d.axmAgreementNumber
+        axmWifiMacAddress      = d.axmWifiMacAddress
+        axmBluetoothMacAddress = d.axmBluetoothMacAddress
+        axmEthernetMacAddress  = d.axmEthernetMacAddress
+        axmImei                = d.axmImei
+        axmMeid                = d.axmMeid
+        axmEid                 = d.axmEid
+        // Written to axmMdmMigrationCapableRaw (String), not axmMdmMigrationCapable
+        // (Boolean) — see the schema comment on axmMdmMigrationCapableRaw for why.
+        axmMdmMigrationCapableRaw = d.axmMdmMigrationCapable
+        axmMdmMigrationStatus  = d.axmMdmMigrationStatus
+        axmMdmMigrationDeadline = d.axmMdmMigrationDeadline
         wbStatus            = d.wbStatus?.rawValue
         wbNote              = d.wbNote
         jamfId              = d.jamfId
@@ -681,6 +706,15 @@ extension CDDevice {
             axmCoverageEndDate:   axmCoverageEndDate,
             axmCoverageFetchedAt: fmt(axmCoverageFetchedAt),
             axmAgreementNumber:   axmAgreementNumber,
+            axmWifiMacAddress:    axmWifiMacAddress,
+            axmBluetoothMacAddress: axmBluetoothMacAddress,
+            axmEthernetMacAddress: axmEthernetMacAddress,
+            axmImei:              axmImei,
+            axmMeid:              axmMeid,
+            axmEid:               axmEid,
+            axmMdmMigrationCapable: axmMdmMigrationCapableRaw,
+            axmMdmMigrationStatus: axmMdmMigrationStatus,
+            axmMdmMigrationDeadline: axmMdmMigrationDeadline,
             wbStatus:             WBStatus(rawValue: wbStatus ?? ""),
             wbPushedAt:           fmt(wbPushedAt),
             wbNote:               wbNote,

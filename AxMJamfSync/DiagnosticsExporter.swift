@@ -125,6 +125,40 @@ enum DiagnosticsExporter {
     return urls.filter { FileManager.default.fileExists(atPath: $0.path) }
   }
 
+  /// Matches the alphanumeric tokens a serial number could appear as, so
+  /// `maskedText` only has to check each candidate against `serialLabels`
+  /// (O(1) dictionary lookup) rather than compiling one regex per serial.
+  private nonisolated static let serialTokenPattern = try! NSRegularExpression(pattern: "[A-Za-z0-9]{6,}")
+
+  /// Replaces every token in `text` that is a known device serial with its
+  /// placeholder. Everything else — including tokens that merely look like a
+  /// serial — passes through untouched.
+  private nonisolated static func maskedText(_ text: String, labels: [String: String]) -> String {
+    guard !labels.isEmpty else { return text }
+    let ns = text as NSString
+    let matches = serialTokenPattern.matches(in: text, range: NSRange(location: 0, length: ns.length))
+    guard !matches.isEmpty else { return text }
+    var result = ""
+    var cursor = 0
+    for match in matches {
+      guard let label = labels[ns.substring(with: match.range)] else { continue }
+      result += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+      result += label
+      cursor = match.range.location + match.range.length
+    }
+    result += ns.substring(from: cursor)
+    return result
+  }
+
+  /// Reads `src` as text, masks known serials, and writes the result to `dst`.
+  /// Skips the file entirely rather than falling back to a raw copy if it
+  /// can't be decoded as UTF-8 — a diagnostics bundle leaving the Mac must
+  /// never risk shipping an unmasked serial.
+  private nonisolated static func copyMaskedLog(from src: URL, to dst: URL, labels: [String: String]) {
+    guard let text = try? String(contentsOf: src, encoding: .utf8) else { return }
+    try? maskedText(text, labels: labels).write(to: dst, atomically: true, encoding: .utf8)
+  }
+
   private nonisolated static func buildAndWriteBundle(
     environments: [AppEnvironment], settingsDumps: [UUID: String],
     scheduleSummary: String, runModeSummary: String, to destination: URL
@@ -133,6 +167,19 @@ enum DiagnosticsExporter {
     let stagingDir = fm.temporaryDirectory.appendingPathComponent("AxMJamfSync-Diagnostics-\(UUID().uuidString)")
     try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
     defer { try? fm.removeItem(at: stagingDir) }
+
+    // Log files carry every synced device's serial number in plain text (see
+    // ARCHITECTURE.md's log redaction rules). Build one serial→placeholder map
+    // across every environment being exported, so a shared log file never
+    // reveals an org's device inventory — and so the same serial reads as the
+    // same placeholder everywhere in the bundle, including the shared sync.log.
+    var allSerials = Set<String>()
+    for env in environments {
+      let persistence = PersistenceController.loadedStore(for: env.id) ?? PersistenceController(environmentId: env.id)
+      allSerials.formUnion(persistence.allSerialNumbers())
+    }
+    let serialLabels = Dictionary(uniqueKeysWithValues:
+      allSerials.sorted().enumerated().map { ($1, "<device \($0 + 1)>") })
 
     let appText = """
     AxM Jamf Sync — Diagnostics
@@ -159,13 +206,13 @@ enum DiagnosticsExporter {
       try dump.write(to: envFolder.appendingPathComponent("settings.txt"), atomically: true, encoding: .utf8)
 
       for logURL in logURLs(stem: env.id.uuidString, in: envLogsDir) {
-        try? fm.copyItem(at: logURL, to: envFolder.appendingPathComponent(logURL.lastPathComponent))
+        copyMaskedLog(from: logURL, to: envFolder.appendingPathComponent(logURL.lastPathComponent), labels: serialLabels)
       }
     }
 
     // Shared app-level log (diagnostics outside any one environment's run).
     for logURL in logURLs(stem: "sync", in: logsRootDir) {
-      try? fm.copyItem(at: logURL, to: stagingDir.appendingPathComponent(logURL.lastPathComponent))
+      copyMaskedLog(from: logURL, to: stagingDir.appendingPathComponent(logURL.lastPathComponent), labels: serialLabels)
     }
 
     // Zip the staging directory. NSFileCoordinator's .forUploading option is

@@ -1100,9 +1100,16 @@ struct CacheSettingsPanel: View {
         resellerValidationMessage = duplicateIds.isEmpty
             ? nil
             : "Duplicate reseller ID(s): \(duplicateIds.sorted().joined(separator: ", ")) — latest value kept."
-        resellerRows = mapped
-            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
-            .map { .init(resellerId: $0.key, vendorName: $0.value) }
+        var seen = Set<String>()
+        var orderedPairs: [(String, String)] = []
+        for row in resellerRows.reversed() {
+            guard !row.resellerId.isEmpty, !row.vendorName.isEmpty else { continue }
+            if seen.insert(row.resellerId).inserted {
+                orderedPairs.append((row.resellerId, row.vendorName))
+            }
+        }
+        orderedPairs.reverse()
+        resellerRows = orderedPairs.map { .init(resellerId: $0.0, vendorName: $0.1) }
         resellerRows.append(contentsOf: draftRows)
         if resellerRows.isEmpty { resellerRows = [.init(resellerId: "", vendorName: "")] }
     }

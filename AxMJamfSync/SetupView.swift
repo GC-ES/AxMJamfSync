@@ -1016,6 +1016,7 @@ struct CacheSettingsPanel: View {
             }
         }
         .onAppear {
+            resellerSaveTask?.cancel()
             coverageLimitText     = prefs.coverageLimit == 0 ? "0" : String(prefs.coverageLimit)
             // Sync local mirrors from prefs (avoids Binding get/set cycle on macOS 26)
             alwaysRefreshCoverage = prefs.alwaysRefreshCoverage
@@ -1048,6 +1049,7 @@ struct CacheSettingsPanel: View {
 
     @MainActor
     private func saveResellerMappings() {
+        resellerSaveTask?.cancel()
         for idx in resellerRows.indices {
             resellerRows[idx].resellerId = resellerRows[idx].resellerId
                 .trimmingCharacters(in: .whitespacesAndNewlines)

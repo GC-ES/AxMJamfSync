@@ -358,6 +358,8 @@ final class AppPreferences: ObservableObject {
             } else if let data = try? JSONEncoder().encode(clean),
                       let str = String(data: data, encoding: .utf8) {
                 resellerVendorMapJSON = str
+            } else {
+                resellerVendorMapJSON = ""
             }
             objectWillChange.send()
         }

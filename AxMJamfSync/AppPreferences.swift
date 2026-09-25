@@ -348,7 +348,7 @@ final class AppPreferences: ObservableObject {
         }
         set {
             let clean = newValue.reduce(into: [String: String]()) { out, pair in
-                let id = pair.key.trimmingCharacters(in: .whitespacesAndNewlines)
+                let id = pair.key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
                 let name = pair.value.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !id.isEmpty, !name.isEmpty else { return }
                 out[id] = name

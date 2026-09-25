@@ -136,7 +136,7 @@ final class SyncEngine: ObservableObject {
     private static func jamfVendorValue(for device: Device, resellerMappings: [String: String]) -> String? {
         guard let source = device.axmPurchaseSource?.trimmingCharacters(in: .whitespacesAndNewlines),
               !source.isEmpty else { return nil }
-        let sourceId = device.axmPurchaseSourceId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourceId = device.axmPurchaseSourceId?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         if source.caseInsensitiveCompare("RESELLER") == .orderedSame,
            let id = sourceId, !id.isEmpty,
            let vendor = resellerMappings[id]?.trimmingCharacters(in: .whitespacesAndNewlines),

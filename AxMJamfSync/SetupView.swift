@@ -1051,15 +1051,16 @@ struct CacheSettingsPanel: View {
         let mapped = currentResellerMappings()
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
-        if resellerRows.isEmpty {
-            resellerRows = [.init(resellerId: "", vendorName: "")]
-        }
+        resellerRows = mapped
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .map { .init(resellerId: $0.key, vendorName: $0.value) }
+        if resellerRows.isEmpty { resellerRows = [.init(resellerId: "", vendorName: "")] }
     }
 
     @MainActor
     private func currentResellerMappings() -> [String: String] {
         resellerRows.reduce(into: [String: String]()) { out, row in
-            let id = row.resellerId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = row.resellerId.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
             let name = row.vendorName.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, !name.isEmpty else { return }
             out[id] = name

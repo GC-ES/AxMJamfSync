@@ -921,8 +921,10 @@ struct CacheSettingsPanel: View {
                                     TextField("Reseller ID", text: $row.resellerId)
                                         .textFieldStyle(.roundedBorder)
                                         .frame(width: 170)
+                                        .onSubmit { saveResellerMappings() }
                                     TextField("Vendor Name", text: $row.vendorName)
                                         .textFieldStyle(.roundedBorder)
+                                        .onSubmit { saveResellerMappings() }
                                     Button(role: .destructive) {
                                         resellerRows.removeAll { $0.id == row.id }
                                         scheduleResellerSave()

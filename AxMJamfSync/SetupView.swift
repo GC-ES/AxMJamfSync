@@ -720,6 +720,7 @@ struct CacheSettingsPanel: View {
     @State private var loadedResellerMappings: [String: String] = [:]
     @State private var resellerSaveTask: Task<Void, Never>? = nil
     @State private var suppressResellerAutosave = false
+    @State private var resellerValidationMessage: String? = nil
     @FocusState private var focusedResellerField: String?
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
@@ -952,6 +953,11 @@ struct CacheSettingsPanel: View {
                             .buttonStyle(.borderless)
                             .font(.caption)
                             .padding(.top, 2)
+                            if let msg = resellerValidationMessage, !msg.isEmpty {
+                                Text(msg)
+                                    .font(.caption2)
+                                    .foregroundStyle(.red)
+                            }
                         }
                     }
                     .onChange(of: resellerRows) { _, _ in
@@ -1077,9 +1083,21 @@ struct CacheSettingsPanel: View {
             let hasVendor = !row.vendorName.isEmpty
             return hasId != hasVendor
         }
+        var seenIds = Set<String>()
+        var duplicateIds = Set<String>()
+        for row in resellerRows where !row.resellerId.isEmpty {
+            if !seenIds.insert(row.resellerId).inserted {
+                duplicateIds.insert(row.resellerId)
+            }
+        }
+        if !duplicateIds.isEmpty {
+            resellerValidationMessage = "Duplicate reseller ID(s): \(duplicateIds.sorted().joined(separator: ", "))"
+            return
+        }
         let mapped = currentResellerMappings()
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
+        resellerValidationMessage = nil
         resellerRows = mapped
             .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
             .map { .init(resellerId: $0.key, vendorName: $0.value) }

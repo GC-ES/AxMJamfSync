@@ -958,6 +958,7 @@ struct CacheSettingsPanel: View {
                             saveResellerMappings()
                         }
                     }
+                    .onDisappear { resellerSaveTask?.cancel() }
 
                     Divider()
 

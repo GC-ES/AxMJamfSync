@@ -276,7 +276,7 @@ Full guides: [Project Wiki](https://github.com/karthikeyan-mac/AxMJamfSync/wiki)
 - **Sync Device Types** — choose Mac + Mobile (default), Mac Only, or Mobile Only
 - **Coverage Fetch Limit** — cap Apple API calls per run; next run resumes exactly where the last stopped
 - **Do Not Refetch** — skip devices already checked, reducing API calls significantly
-- **Purchasing fields** — PO Number, PO Date, and Vendor (formatted as `"purchaseSourceType (purchaseSourceId)"`) are written to Jamf alongside warranty data
+- **Purchasing fields** — PO Number, PO Date, and Vendor are written to Jamf alongside warranty data; reseller-source devices can map `purchaseSourceId` values to friendly vendor names in Setup
 - **External change detection** — if warranty date, vendor, PO number, or PO date are edited in Jamf after a sync, the next run re-queues those devices automatically
 - **Serial sync queue** — all syncs run serially; clicking Run Sync while another environment is syncing adds it to the queue rather than running in parallel
 - **Scheduled syncs** — set a recurring cadence in Settings → Schedule; scheduled runs go through the same serial queue as Sync All, with start and completion notifications

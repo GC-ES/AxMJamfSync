@@ -1556,6 +1556,7 @@ extension ExportColumn {
         .init(id: "axmMdmMigrationStatus", label: "MDM Migration Status",    enabled: false),
         .init(id: "axmMdmMigrationDeadline", label: "MDM Migration Deadline", enabled: false),
         .init(id: "axmPurchaseSource",     label: "Purchase Source",         enabled: true),
+        .init(id: "axmOrderDate",          label: "Order Date",              enabled: true),
         .init(id: "wbStatus",              label: "Jamf Update Status",      enabled: true),
         .init(id: "wbPushedAt",            label: "Jamf Update Pushed At",   enabled: false),
         .init(id: "jamfName",              label: "Jamf Device Name",        enabled: true),
@@ -1596,6 +1597,7 @@ extension Device {
         case "axmMdmMigrationStatus": return axmMdmMigrationStatus
         case "axmMdmMigrationDeadline": return axmMdmMigrationDeadline
         case "axmPurchaseSource":     return axmPurchaseSource
+        case "axmOrderDate":          return axmOrderDate
         case "wbStatus":              return wbStatus?.label
         case "wbPushedAt":            return wbPushedAt
         case "wbNote":                return wbNote

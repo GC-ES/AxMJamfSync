@@ -696,6 +696,12 @@ struct APIPrivilegesPopover: View {
 // MARK: - Cache & Sync Options Panel (simplified — #3)
 
 struct CacheSettingsPanel: View {
+    private struct ResellerMappingRow: Identifiable, Equatable {
+        let id = UUID()
+        var resellerId: String
+        var vendorName: String
+    }
+
     @EnvironmentObject private var store: AppStore
     @EnvironmentObject private var prefs: AppPreferences
     let engine: SyncEngine   // kept for resetCache call only — not observed
@@ -709,6 +715,7 @@ struct CacheSettingsPanel: View {
     @State private var skipExistingCoverage  = false
     @State private var alwaysRefreshDevices  = false
     @State private var syncDeviceScope: SyncDeviceScope = .both
+    @State private var resellerRows: [ResellerMappingRow] = []
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
 
@@ -894,6 +901,53 @@ struct CacheSettingsPanel: View {
 
                     Divider()
 
+                    VStack(alignment: .leading, spacing: 8) {
+                        InfoLabel(
+                            text: "Reseller Vendor Mapping",
+                            info: InfoContent(
+                                icon:    "building.2.crop.circle",
+                                title:   "Reseller Vendor Mapping",
+                                summary: "Map Apple reseller source IDs to human-friendly vendor names used in Jamf write-back.",
+                                bullets: [
+                                    "Only used when Apple reports purchaseSourceType as RESELLER.",
+                                    "If a source ID matches one of these reseller IDs, Jamf Vendor is set to the mapped vendor name.",
+                                    "If no match exists, the sync keeps the default RESELLER (sourceId) format."
+                                ]
+                            ))
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach($resellerRows) { $row in
+                                HStack(spacing: 8) {
+                                    TextField("Reseller ID", text: $row.resellerId)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 170)
+                                    TextField("Vendor Name", text: $row.vendorName)
+                                        .textFieldStyle(.roundedBorder)
+                                    Button(role: .destructive) {
+                                        resellerRows.removeAll { $0.id == row.id }
+                                        saveResellerMappings()
+                                    } label: {
+                                        Image(systemName: "minus.circle")
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Remove mapping row")
+                                }
+                            }
+                            Button {
+                                resellerRows.append(.init(resellerId: "", vendorName: ""))
+                            } label: {
+                                Label("Add Reseller Mapping", systemImage: "plus.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                            .padding(.top, 2)
+                        }
+                    }
+                    .onChange(of: resellerRows) { _, _ in
+                        saveResellerMappings()
+                    }
+
+                    Divider()
+
                     // Cache location + delete
                     VStack(alignment: .leading, spacing: 4) {
                         InfoLabel(
@@ -954,9 +1008,25 @@ struct CacheSettingsPanel: View {
             skipExistingCoverage  = prefs.skipExistingCoverage
             alwaysRefreshDevices  = prefs.alwaysRefreshDevices
             syncDeviceScope       = prefs.syncDeviceScope
+            resellerRows          = prefs.resellerVendorMappings
+                .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+                .map { .init(resellerId: $0.key, vendorName: $0.value) }
+            if resellerRows.isEmpty {
+                resellerRows = [.init(resellerId: "", vendorName: "")]
+            }
         }
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
+    }
+
+    private func saveResellerMappings() {
+        let mapped = resellerRows.reduce(into: [String: String]()) { out, row in
+            let id = row.resellerId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = row.vendorName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !name.isEmpty else { return }
+            out[id] = name
+        }
+        prefs.resellerVendorMappings = mapped
     }
 }
 
@@ -1024,4 +1094,3 @@ struct InlineCredentialField: View {
         }
     }
 }
-

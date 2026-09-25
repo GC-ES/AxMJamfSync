@@ -133,6 +133,22 @@ final class SyncEngine: ObservableObject {
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
     }
 
+    private static func jamfVendorValue(for device: Device, resellerMappings: [String: String]) -> String? {
+        guard let source = device.axmPurchaseSource?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !source.isEmpty else { return nil }
+        let sourceId = device.axmPurchaseSourceId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if source.caseInsensitiveCompare("RESELLER") == .orderedSame,
+           let id = sourceId, !id.isEmpty,
+           let vendor = resellerMappings[id]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !vendor.isEmpty {
+            return vendor
+        }
+        if let id = sourceId, !id.isEmpty {
+            return "\(source) (\(id))"
+        }
+        return source
+    }
+
     var fraction: Double {
         guard totalSteps > 0 else { return 0 }
         return min(max(Double(currentStep) / Double(totalSteps), 0), 1)
@@ -1123,6 +1139,7 @@ final class SyncEngine: ObservableObject {
             }
 
             var wbSynced = 0, wbFailed = 0, wbSkipped = 0
+            let resellerMappings = store.prefs.resellerVendorMappings
 
             if wbTargets.isEmpty {
                 log.info("Jamf Update: nothing pending.")
@@ -1177,15 +1194,7 @@ final class SyncEngine: ObservableObject {
                                 }
                                 // Inner helper — attempt one PATCH, return the WBResult.
                                 // Extracted so we can call it twice (initial + -999 retry).
-                                // Build vendor string: "purchaseSourceType (purchaseSourceId)"
-                                // If purchaseSourceId is nil/empty, use purchaseSourceType alone.
-                                let vendorStr: String? = {
-                                    guard let src = device.axmPurchaseSource, !src.isEmpty else { return nil }
-                                    if let sid = device.axmPurchaseSourceId, !sid.isEmpty {
-                                        return "\(src) (\(sid))"
-                                    }
-                                    return src
-                                }()
+                                let vendorStr = Self.jamfVendorValue(for: device, resellerMappings: resellerMappings)
                                 func attempt() async throws {
                                     if device.isMobile {
                                         try await jamfService.writeWarrantyBackMobile(
@@ -1294,11 +1303,7 @@ final class SyncEngine: ObservableObject {
 
                         for device in toRetry {
                             guard let jamfId = device.jamfId else { continue }
-                            let retryVendor: String? = {
-                                guard let src = device.axmPurchaseSource, !src.isEmpty else { return nil }
-                                if let sid = device.axmPurchaseSourceId, !sid.isEmpty { return "\(src) (\(sid))" }
-                                return src
-                            }()
+                            let retryVendor = Self.jamfVendorValue(for: device, resellerMappings: resellerMappings)
                             do {
                                 if device.isMobile {
                                     try await jamfService.writeWarrantyBackMobile(

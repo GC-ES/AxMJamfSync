@@ -56,6 +56,7 @@ enum PrefKey {
     static let dataCachedScope        = "dataCachedScope"
     static let syncDeviceScope        = "syncDeviceScope"
     static let dashboardFocus         = "dashboardFocus"
+    static let resellerVendorMapJSON  = "resellerVendorMapJSON"
     // Cursor resume — saves the last successful cursor + fetched count so a
     // failed mid-fetch can resume from exactly where it stopped on next run.
     static let axmResumeCursor        = "axmResumeCursor"
@@ -194,6 +195,10 @@ final class AppPreferences: ObservableObject {
         get { string(PrefKey.exportColumnJSON, default: "") }
         set { ud.set(newValue, forKey: k(PrefKey.exportColumnJSON)) }
     }
+    private var resellerVendorMapJSON: String {
+        get { string(PrefKey.resellerVendorMapJSON, default: "") }
+        set { ud.set(newValue, forKey: k(PrefKey.resellerVendorMapJSON)) }
+    }
 
     // MARK: - Last run summary — persisted across launches
     var lrDateEpoch: Double {
@@ -307,6 +312,33 @@ final class AppPreferences: ObservableObject {
         guard !exportColumnJSON.isEmpty, let data = exportColumnJSON.data(using: .utf8) else {
             return ExportColumn.defaultColumns
         }
+
+        // MARK: - Reseller ID → vendor name mapping
+        var resellerVendorMappings: [String: String] {
+            get {
+                guard !resellerVendorMapJSON.isEmpty,
+                      let data = resellerVendorMapJSON.data(using: .utf8),
+                      let decoded = try? JSONDecoder().decode([String: String].self, from: data) else {
+                    return [:]
+                }
+                return decoded
+            }
+            set {
+                let clean = newValue.reduce(into: [String: String]()) { out, pair in
+                    let id = pair.key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let name = pair.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !id.isEmpty, !name.isEmpty else { return }
+                    out[id] = name
+                }
+                if clean.isEmpty {
+                    resellerVendorMapJSON = ""
+                } else if let data = try? JSONEncoder().encode(clean),
+                          let str = String(data: data, encoding: .utf8) {
+                    resellerVendorMapJSON = str
+                }
+                objectWillChange.send()
+            }
+        }
         if let ordered = try? JSONDecoder().decode([StoredColumnState].self, from: data) {
             let defaults = Dictionary(uniqueKeysWithValues: ExportColumn.defaultColumns.map { ($0.id, $0) })
             var seen: Set<String> = []
@@ -418,6 +450,7 @@ final class AppPreferences: ObservableObject {
             PrefKey.dataCachedScope,
             PrefKey.syncDeviceScope,
             PrefKey.dashboardFocus,
+            PrefKey.resellerVendorMapJSON,
             PrefKey.jamfValidatedOrigin,
         ]
         for key in settingsKeys {

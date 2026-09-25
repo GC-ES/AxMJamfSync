@@ -447,7 +447,7 @@ actor JamfService {
         jamfId:         String,
         warrantyDate:   String?,    // YYYY-MM-DD from axm_coverage_end_date
         appleCareId:    String?,    // from axm_agreement_number
-        vendor:         String?,    // "purchaseSourceType (purchaseSourceId)"
+        vendor:         String?,    // purchase source value (or mapped reseller vendor name)
         poNumber:       String?,    // from axm_order_number
         poDate:         String?,    // YYYY-MM-DD from axm_order_date
         mappingValidated: Bool = true,  // S2: false = serial→jamfId map not confirmed against this host
@@ -638,7 +638,7 @@ actor JamfService {
         serialNumber:   String,     // fallback `name` — see the blank-name retry below
         warrantyDate:   String?,    // YYYY-MM-DD — converted to ISO8601 for mobile API
         appleCareId:    String?,
-        vendor:         String?,    // "purchaseSourceType (purchaseSourceId)"
+        vendor:         String?,    // purchase source value (or mapped reseller vendor name)
         poNumber:       String?,    // from axm_order_number
         poDate:         String?,    // YYYY-MM-DD from axm_order_date
         mappingValidated: Bool = true,  // S2: see writeWarrantyBack

@@ -720,6 +720,7 @@ struct CacheSettingsPanel: View {
     @State private var loadedResellerMappings: [String: String] = [:]
     @State private var resellerSaveTask: Task<Void, Never>? = nil
     @State private var suppressResellerAutosave = false
+    @State private var didLoadResellerRows = false
     @FocusState private var focusedResellerField: String?
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
@@ -1028,12 +1029,15 @@ struct CacheSettingsPanel: View {
             skipExistingCoverage  = prefs.skipExistingCoverage
             alwaysRefreshDevices  = prefs.alwaysRefreshDevices
             syncDeviceScope       = prefs.syncDeviceScope
-            loadedResellerMappings = prefs.resellerVendorMappings
-            resellerRows          = loadedResellerMappings
-                .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
-                .map { .init(resellerId: $0.key, vendorName: $0.value) }
-            if resellerRows.isEmpty {
-                resellerRows = [.init(resellerId: "", vendorName: "")]
+            if !didLoadResellerRows {
+                loadedResellerMappings = prefs.resellerVendorMappings
+                resellerRows          = loadedResellerMappings
+                    .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+                    .map { .init(resellerId: $0.key, vendorName: $0.value) }
+                if resellerRows.isEmpty {
+                    resellerRows = [.init(resellerId: "", vendorName: "")]
+                }
+                didLoadResellerRows = true
             }
         }
         .disabled(isRunning)

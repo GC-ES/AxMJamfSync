@@ -1035,7 +1035,7 @@ struct CacheSettingsPanel: View {
 
     private func scheduleResellerSave() {
         resellerSaveTask?.cancel()
-        resellerSaveTask = Task {
+        resellerSaveTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 800_000_000)
             guard !Task.isCancelled else { return }
             let current = currentResellerMappings()
@@ -1045,12 +1045,14 @@ struct CacheSettingsPanel: View {
         }
     }
 
+    @MainActor
     private func saveResellerMappings() {
         let mapped = currentResellerMappings()
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
     }
 
+    @MainActor
     private func currentResellerMappings() -> [String: String] {
         resellerRows.reduce(into: [String: String]()) { out, row in
             let id = row.resellerId.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -926,14 +926,14 @@ struct CacheSettingsPanel: View {
                                         .textFieldStyle(.roundedBorder)
                                         .frame(width: 170)
                                         .focused($focusedResellerField, equals: "\(row.id.uuidString)-id")
-                                        .onSubmit { saveResellerMappings() }
+                                        .onSubmit { scheduleResellerSave() }
                                     TextField("Vendor Name", text: $row.vendorName)
                                         .textFieldStyle(.roundedBorder)
                                         .focused($focusedResellerField, equals: "\(row.id.uuidString)-name")
-                                        .onSubmit { saveResellerMappings() }
+                                        .onSubmit { scheduleResellerSave() }
                                     Button(role: .destructive) {
                                         resellerRows.removeAll { $0.id == row.id }
-                                        saveResellerMappings()
+                                        scheduleResellerSave()
                                     } label: {
                                         Image(systemName: "minus.circle")
                                     }
@@ -957,7 +957,7 @@ struct CacheSettingsPanel: View {
                     }
                     .onChange(of: focusedResellerField) { _, newVal in
                         if newVal == nil {
-                            saveResellerMappings()
+                            scheduleResellerSave()
                         }
                     }
                     .onDisappear { resellerSaveTask?.cancel() }

@@ -1051,6 +1051,9 @@ struct CacheSettingsPanel: View {
         let mapped = currentResellerMappings()
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
+        if resellerRows.isEmpty {
+            resellerRows = [.init(resellerId: "", vendorName: "")]
+        }
     }
 
     @MainActor

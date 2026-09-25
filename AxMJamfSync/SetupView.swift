@@ -302,6 +302,7 @@ struct AxMCredentialsPanel: View {
         }
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
+        .onDisappear { resellerSaveTask?.cancel() }
     }
 
     private func pickFile() {
@@ -718,6 +719,7 @@ struct CacheSettingsPanel: View {
     @State private var resellerRows: [ResellerMappingRow] = []
     @State private var loadedResellerMappings: [String: String] = [:]
     @State private var resellerSaveTask: Task<Void, Never>? = nil
+    @FocusState private var focusedResellerField: String?
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
 
@@ -922,9 +924,11 @@ struct CacheSettingsPanel: View {
                                     TextField("Reseller ID", text: $row.resellerId)
                                         .textFieldStyle(.roundedBorder)
                                         .frame(width: 170)
+                                        .focused($focusedResellerField, equals: "\(row.id.uuidString)-id")
                                         .onSubmit { saveResellerMappings() }
                                     TextField("Vendor Name", text: $row.vendorName)
                                         .textFieldStyle(.roundedBorder)
+                                        .focused($focusedResellerField, equals: "\(row.id.uuidString)-name")
                                         .onSubmit { saveResellerMappings() }
                                     Button(role: .destructive) {
                                         resellerRows.removeAll { $0.id == row.id }
@@ -948,6 +952,11 @@ struct CacheSettingsPanel: View {
                     }
                     .onChange(of: resellerRows) { _, _ in
                         scheduleResellerSave()
+                    }
+                    .onChange(of: focusedResellerField) { _, newVal in
+                        if newVal == nil {
+                            saveResellerMappings()
+                        }
                     }
 
                     Divider()
@@ -1022,13 +1031,6 @@ struct CacheSettingsPanel: View {
         }
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
-        .onDisappear {
-            resellerSaveTask?.cancel()
-            let current = currentResellerMappings()
-            if current != loadedResellerMappings {
-                saveResellerMappings()
-            }
-        }
     }
 
     private func scheduleResellerSave() {

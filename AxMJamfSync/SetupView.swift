@@ -1064,9 +1064,18 @@ struct CacheSettingsPanel: View {
             resellerRows[idx].vendorName = resellerRows[idx].vendorName
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        let draftRows = resellerRows.filter { row in
+            let hasId = !row.resellerId.isEmpty
+            let hasVendor = !row.vendorName.isEmpty
+            return hasId != hasVendor
+        }
         let mapped = currentResellerMappings()
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
+        resellerRows = mapped
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .map { .init(resellerId: $0.key, vendorName: $0.value) }
+        resellerRows.append(contentsOf: draftRows)
         if resellerRows.isEmpty { resellerRows = [.init(resellerId: "", vendorName: "")] }
     }
 

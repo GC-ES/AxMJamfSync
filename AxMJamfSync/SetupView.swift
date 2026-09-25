@@ -719,6 +719,7 @@ struct CacheSettingsPanel: View {
     @State private var resellerRows: [ResellerMappingRow] = []
     @State private var loadedResellerMappings: [String: String] = [:]
     @State private var resellerSaveTask: Task<Void, Never>? = nil
+    @State private var suppressResellerAutosave = false
     @FocusState private var focusedResellerField: String?
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
@@ -951,6 +952,7 @@ struct CacheSettingsPanel: View {
                         }
                     }
                     .onChange(of: resellerRows) { _, _ in
+                        guard !suppressResellerAutosave else { return }
                         scheduleResellerSave()
                     }
                     .onChange(of: focusedResellerField) { _, newVal in
@@ -1050,6 +1052,8 @@ struct CacheSettingsPanel: View {
     @MainActor
     private func saveResellerMappings() {
         resellerSaveTask?.cancel()
+        suppressResellerAutosave = true
+        defer { suppressResellerAutosave = false }
         for idx in resellerRows.indices {
             resellerRows[idx].resellerId = resellerRows[idx].resellerId
                 .trimmingCharacters(in: .whitespacesAndNewlines)

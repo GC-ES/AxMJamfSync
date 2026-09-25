@@ -1048,12 +1048,16 @@ struct CacheSettingsPanel: View {
 
     @MainActor
     private func saveResellerMappings() {
+        for idx in resellerRows.indices {
+            resellerRows[idx].resellerId = resellerRows[idx].resellerId
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .uppercased()
+            resellerRows[idx].vendorName = resellerRows[idx].vendorName
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         let mapped = currentResellerMappings()
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
-        resellerRows = mapped
-            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
-            .map { .init(resellerId: $0.key, vendorName: $0.value) }
         if resellerRows.isEmpty { resellerRows = [.init(resellerId: "", vendorName: "")] }
     }
 

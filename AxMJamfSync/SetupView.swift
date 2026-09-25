@@ -933,6 +933,9 @@ struct CacheSettingsPanel: View {
                                         .onSubmit { scheduleResellerSave() }
                                     Button(role: .destructive) {
                                         resellerRows.removeAll { $0.id == row.id }
+                                        if resellerRows.isEmpty {
+                                            resellerRows = [.init(resellerId: "", vendorName: "")]
+                                        }
                                         scheduleResellerSave()
                                     } label: {
                                         Image(systemName: "minus.circle")

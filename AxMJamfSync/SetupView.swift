@@ -716,6 +716,7 @@ struct CacheSettingsPanel: View {
     @State private var alwaysRefreshDevices  = false
     @State private var syncDeviceScope: SyncDeviceScope = .both
     @State private var resellerRows: [ResellerMappingRow] = []
+    @State private var resellerSaveTask: Task<Void, Never>? = nil
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
 
@@ -924,7 +925,7 @@ struct CacheSettingsPanel: View {
                                         .textFieldStyle(.roundedBorder)
                                     Button(role: .destructive) {
                                         resellerRows.removeAll { $0.id == row.id }
-                                        saveResellerMappings()
+                                        scheduleResellerSave()
                                     } label: {
                                         Image(systemName: "minus.circle")
                                     }
@@ -943,7 +944,7 @@ struct CacheSettingsPanel: View {
                         }
                     }
                     .onChange(of: resellerRows) { _, _ in
-                        saveResellerMappings()
+                        scheduleResellerSave()
                     }
 
                     Divider()
@@ -1017,6 +1018,19 @@ struct CacheSettingsPanel: View {
         }
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
+        .onDisappear {
+            resellerSaveTask?.cancel()
+            saveResellerMappings()
+        }
+    }
+
+    private func scheduleResellerSave() {
+        resellerSaveTask?.cancel()
+        resellerSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            saveResellerMappings()
+        }
     }
 
     private func saveResellerMappings() {

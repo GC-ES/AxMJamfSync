@@ -312,33 +312,6 @@ final class AppPreferences: ObservableObject {
         guard !exportColumnJSON.isEmpty, let data = exportColumnJSON.data(using: .utf8) else {
             return ExportColumn.defaultColumns
         }
-
-        // MARK: - Reseller ID → vendor name mapping
-        var resellerVendorMappings: [String: String] {
-            get {
-                guard !resellerVendorMapJSON.isEmpty,
-                      let data = resellerVendorMapJSON.data(using: .utf8),
-                      let decoded = try? JSONDecoder().decode([String: String].self, from: data) else {
-                    return [:]
-                }
-                return decoded
-            }
-            set {
-                let clean = newValue.reduce(into: [String: String]()) { out, pair in
-                    let id = pair.key.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let name = pair.value.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !id.isEmpty, !name.isEmpty else { return }
-                    out[id] = name
-                }
-                if clean.isEmpty {
-                    resellerVendorMapJSON = ""
-                } else if let data = try? JSONEncoder().encode(clean),
-                          let str = String(data: data, encoding: .utf8) {
-                    resellerVendorMapJSON = str
-                }
-                objectWillChange.send()
-            }
-        }
         if let ordered = try? JSONDecoder().decode([StoredColumnState].self, from: data) {
             let defaults = Dictionary(uniqueKeysWithValues: ExportColumn.defaultColumns.map { ($0.id, $0) })
             var seen: Set<String> = []
@@ -361,6 +334,33 @@ final class AppPreferences: ObservableObject {
             }
         }
         return ExportColumn.defaultColumns
+    }
+
+    // MARK: - Reseller ID → vendor name mapping
+    var resellerVendorMappings: [String: String] {
+        get {
+            guard !resellerVendorMapJSON.isEmpty,
+                  let data = resellerVendorMapJSON.data(using: .utf8),
+                  let decoded = try? JSONDecoder().decode([String: String].self, from: data) else {
+                return [:]
+            }
+            return decoded
+        }
+        set {
+            let clean = newValue.reduce(into: [String: String]()) { out, pair in
+                let id = pair.key.trimmingCharacters(in: .whitespacesAndNewlines)
+                let name = pair.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !id.isEmpty, !name.isEmpty else { return }
+                out[id] = name
+            }
+            if clean.isEmpty {
+                resellerVendorMapJSON = ""
+            } else if let data = try? JSONEncoder().encode(clean),
+                      let str = String(data: data, encoding: .utf8) {
+                resellerVendorMapJSON = str
+            }
+            objectWillChange.send()
+        }
     }
 
     // MARK: - Cursor resume state

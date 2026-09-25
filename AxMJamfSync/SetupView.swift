@@ -716,7 +716,7 @@ struct CacheSettingsPanel: View {
     @State private var alwaysRefreshDevices  = false
     @State private var syncDeviceScope: SyncDeviceScope = .both
     @State private var resellerRows: [ResellerMappingRow] = []
-    @State private var resellerSaveTask: Task<Void, Never>? = nil
+    @State private var loadedResellerMappings: [String: String] = [:]
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
 
@@ -927,7 +927,7 @@ struct CacheSettingsPanel: View {
                                         .onSubmit { saveResellerMappings() }
                                     Button(role: .destructive) {
                                         resellerRows.removeAll { $0.id == row.id }
-                                        scheduleResellerSave()
+                                        saveResellerMappings()
                                     } label: {
                                         Image(systemName: "minus.circle")
                                     }
@@ -944,9 +944,6 @@ struct CacheSettingsPanel: View {
                             .font(.caption)
                             .padding(.top, 2)
                         }
-                    }
-                    .onChange(of: resellerRows) { _, _ in
-                        scheduleResellerSave()
                     }
 
                     Divider()
@@ -1011,7 +1008,8 @@ struct CacheSettingsPanel: View {
             skipExistingCoverage  = prefs.skipExistingCoverage
             alwaysRefreshDevices  = prefs.alwaysRefreshDevices
             syncDeviceScope       = prefs.syncDeviceScope
-            resellerRows          = prefs.resellerVendorMappings
+            loadedResellerMappings = prefs.resellerVendorMappings
+            resellerRows          = loadedResellerMappings
                 .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
                 .map { .init(resellerId: $0.key, vendorName: $0.value) }
             if resellerRows.isEmpty {
@@ -1021,28 +1019,26 @@ struct CacheSettingsPanel: View {
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
         .onDisappear {
-            resellerSaveTask?.cancel()
-            saveResellerMappings()
-        }
-    }
-
-    private func scheduleResellerSave() {
-        resellerSaveTask?.cancel()
-        resellerSaveTask = Task {
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            guard !Task.isCancelled else { return }
-            saveResellerMappings()
+            let current = currentResellerMappings()
+            if current != loadedResellerMappings {
+                saveResellerMappings()
+            }
         }
     }
 
     private func saveResellerMappings() {
-        let mapped = resellerRows.reduce(into: [String: String]()) { out, row in
+        let mapped = currentResellerMappings()
+        prefs.resellerVendorMappings = mapped
+        loadedResellerMappings = mapped
+    }
+
+    private func currentResellerMappings() -> [String: String] {
+        resellerRows.reduce(into: [String: String]()) { out, row in
             let id = row.resellerId.trimmingCharacters(in: .whitespacesAndNewlines)
             let name = row.vendorName.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, !name.isEmpty else { return }
             out[id] = name
         }
-        prefs.resellerVendorMappings = mapped
     }
 }
 

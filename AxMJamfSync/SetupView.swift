@@ -1090,7 +1090,11 @@ struct CacheSettingsPanel: View {
                 duplicateIds.insert(row.resellerId)
             }
         }
-        let mapped = currentResellerMappings()
+        var mapped: [String: String] = [:]
+        for row in resellerRows {
+            guard !row.resellerId.isEmpty, !row.vendorName.isEmpty else { continue }
+            mapped[row.resellerId] = row.vendorName  // later rows intentionally win
+        }
         prefs.resellerVendorMappings = mapped
         loadedResellerMappings = mapped
         resellerValidationMessage = duplicateIds.isEmpty

@@ -717,6 +717,7 @@ struct CacheSettingsPanel: View {
     @State private var syncDeviceScope: SyncDeviceScope = .both
     @State private var resellerRows: [ResellerMappingRow] = []
     @State private var loadedResellerMappings: [String: String] = [:]
+    @State private var resellerSaveTask: Task<Void, Never>? = nil
 
     private var scopeAbbrev: String { store.axmCredentials.scope == .school ? "ASM" : "ABM" }
 
@@ -945,6 +946,9 @@ struct CacheSettingsPanel: View {
                             .padding(.top, 2)
                         }
                     }
+                    .onChange(of: resellerRows) { _, _ in
+                        scheduleResellerSave()
+                    }
 
                     Divider()
 
@@ -1019,6 +1023,19 @@ struct CacheSettingsPanel: View {
         .disabled(isRunning)
         .opacity(isRunning ? 0.5 : 1)
         .onDisappear {
+            resellerSaveTask?.cancel()
+            let current = currentResellerMappings()
+            if current != loadedResellerMappings {
+                saveResellerMappings()
+            }
+        }
+    }
+
+    private func scheduleResellerSave() {
+        resellerSaveTask?.cancel()
+        resellerSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
             let current = currentResellerMappings()
             if current != loadedResellerMappings {
                 saveResellerMappings()
